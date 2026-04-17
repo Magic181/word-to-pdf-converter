@@ -1,12 +1,15 @@
 # Word to PDF Converter
 
-A lightweight Windows CLI tool for converting Word documents to PDF with high layout fidelity.
+A lightweight Windows tool for converting Word documents to PDF with high layout fidelity.
 
-This project uses `pywin32` to automate a locally installed Microsoft Word instance and export `.doc` or `.docx` files to PDF. For personal desktop use on Windows, this is usually one of the most reliable ways to preserve pagination, fonts, headers, footers, and overall document layout.
+This project uses `pywin32` to automate a locally installed Microsoft Word instance and export `.doc` or `.docx` files to PDF. It now supports both command-line usage and a desktop GUI, including batch conversion for entire directories.
 
 ## Features
 
 - Convert `.doc` and `.docx` files to PDF
+- Launch a desktop GUI for easier everyday use
+- Batch-convert all Word files in a directory
+- Optionally scan subdirectories recursively
 - Use the source filename by default and export beside the original document
 - Support custom output paths
 - Support overwriting an existing PDF
@@ -46,6 +49,18 @@ Run the installed command:
 wp-transform "D:\docs\example.docx"
 ```
 
+Launch the GUI:
+
+```bash
+python main.py --gui
+```
+
+Or simply run without arguments:
+
+```bash
+python main.py
+```
+
 Specify an output PDF path:
 
 ```bash
@@ -58,6 +73,24 @@ Overwrite an existing PDF:
 wp-transform "D:\docs\example.docx" --overwrite
 ```
 
+Batch-convert a directory:
+
+```bash
+wp-transform "D:\docs\word-files" -o "D:\docs\pdf-output" --overwrite
+```
+
+Batch-convert a directory recursively:
+
+```bash
+wp-transform "D:\docs\word-files" -o "D:\docs\pdf-output" --recursive --overwrite
+```
+
+When the input is a directory:
+
+- `input_path` is treated as the source folder
+- `-o/--output` is treated as the target folder
+- the relative folder structure is preserved in the output directory
+
 ## Example Output
 
 ```text
@@ -69,6 +102,7 @@ Converted successfully: D:\docs\example.pdf
 - If Microsoft Word is not installed, conversion will fail.
 - This tool is designed for local desktop use, not for headless servers.
 - The conversion quality depends on Word being able to open the source document normally.
+- In batch mode, files that fail to convert are reported individually in the log or terminal output.
 
 ## Project Structure
 
