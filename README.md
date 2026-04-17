@@ -77,8 +77,7 @@ Converted successfully: D:\docs\example.pdf
 ├── main.py
 ├── pyproject.toml
 ├── requirements.txt
-├── README.md
-└── 需求.md
+└── README.md
 ```
 
 ## License
