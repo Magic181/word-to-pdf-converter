@@ -271,8 +271,8 @@ class WordToPdfApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Word to PDF Converter")
-        self.root.geometry("1140x760")
-        self.root.minsize(1000, 700)
+        self.root.geometry("1220x820")
+        self.root.minsize(1080, 740)
         self.root.configure(bg="#eef3f1")
 
         self.mode_var = tk.StringVar(value="file")
@@ -280,12 +280,17 @@ class WordToPdfApp:
         self.output_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=False)
         self.overwrite_var = tk.BooleanVar(value=False)
+        self.failures_only_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(
             value="Ready. Select a Word file or a directory to begin."
         )
+        self.summary_var = tk.StringVar(value="No results yet.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.worker_thread: threading.Thread | None = None
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.result_rows: list[dict[str, str]] = []
+        self.sort_column = "status"
+        self.sort_descending = False
 
         self._apply_styles()
         self._build_ui()
@@ -407,8 +412,9 @@ class WordToPdfApp:
             fieldbackground="#f7f9fb",
             foreground=self.colors["text"],
             bordercolor=self.colors["border"],
-            rowheight=28,
+            rowheight=34,
             relief="flat",
+            font=("Segoe UI", 9),
         )
         style.map(
             "Results.Treeview",
@@ -483,12 +489,12 @@ class WordToPdfApp:
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
-        body.columnconfigure(0, weight=11)
-        body.columnconfigure(1, weight=8)
+        body.columnconfigure(0, weight=10)
+        body.columnconfigure(1, weight=9)
         body.rowconfigure(1, weight=1)
 
         left_column = ttk.Frame(body, style="App.TFrame")
-        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 18))
+        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 20))
         left_column.columnconfigure(0, weight=1)
 
         right_column = ttk.Frame(body, style="App.TFrame")
@@ -622,14 +628,32 @@ class WordToPdfApp:
             font=("Segoe UI", 9),
             fg=self.colors["muted"],
             bg=self.colors["card"],
-            wraplength=360,
+            wraplength=430,
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
         log_frame = ttk.LabelFrame(right_column, text="Results", padding=20, style="Card.TLabelframe")
         log_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
-        log_frame.rowconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
+
+        results_toolbar = ttk.Frame(log_frame, style="Card.TFrame")
+        results_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        results_toolbar.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            results_toolbar,
+            text="Only show failures",
+            variable=self.failures_only_var,
+            command=self._refresh_results_table,
+            style="App.TCheckbutton",
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(
+            results_toolbar,
+            textvariable=self.summary_var,
+            style="Muted.TLabel",
+        ).grid(row=0, column=1, sticky="e")
 
         columns = ("status", "source", "output", "details")
         self.results_table = ttk.Treeview(
@@ -638,15 +662,23 @@ class WordToPdfApp:
             show="headings",
             style="Results.Treeview",
         )
-        self.results_table.heading("status", text="Status")
-        self.results_table.heading("source", text="Source")
-        self.results_table.heading("output", text="Output")
-        self.results_table.heading("details", text="Details")
-        self.results_table.column("status", width=90, minwidth=80, anchor="center")
-        self.results_table.column("source", width=210, minwidth=160, anchor="w")
-        self.results_table.column("output", width=210, minwidth=160, anchor="w")
-        self.results_table.column("details", width=260, minwidth=220, anchor="w")
-        self.results_table.grid(row=0, column=0, sticky="nsew")
+        self.results_table.heading(
+            "status", text="Status", command=lambda: self._sort_results_by("status")
+        )
+        self.results_table.heading(
+            "source", text="Source", command=lambda: self._sort_results_by("source")
+        )
+        self.results_table.heading(
+            "output", text="Output", command=lambda: self._sort_results_by("output")
+        )
+        self.results_table.heading(
+            "details", text="Details", command=lambda: self._sort_results_by("details")
+        )
+        self.results_table.column("status", width=110, minwidth=100, anchor="center", stretch=False)
+        self.results_table.column("source", width=270, minwidth=220, anchor="w")
+        self.results_table.column("output", width=270, minwidth=220, anchor="w")
+        self.results_table.column("details", width=380, minwidth=320, anchor="w")
+        self.results_table.grid(row=1, column=0, sticky="nsew")
         self.results_table.tag_configure("ok", background="#edf7f2", foreground="#1d5d43")
         self.results_table.tag_configure("failed", background="#fbefef", foreground="#8a2f2f")
         self.results_table.tag_configure("error", background="#fff4e8", foreground="#8c4b1f")
@@ -657,13 +689,13 @@ class WordToPdfApp:
         table_scroll_y = ttk.Scrollbar(
             log_frame, orient="vertical", command=self.results_table.yview
         )
-        table_scroll_y.grid(row=0, column=1, sticky="ns")
+        table_scroll_y.grid(row=1, column=1, sticky="ns")
         self.results_table.configure(yscrollcommand=table_scroll_y.set)
 
         table_scroll_x = ttk.Scrollbar(
             log_frame, orient="horizontal", command=self.results_table.xview
         )
-        table_scroll_x.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        table_scroll_x.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         self.results_table.configure(xscrollcommand=table_scroll_x.set)
 
     def _build_context_menu(self) -> None:
@@ -727,24 +759,120 @@ class WordToPdfApp:
         output: str,
         details: str,
     ) -> None:
-        normalized_status = status.upper()
-        tag = {
+        self.result_rows.append(
+            {
+                "status": status,
+                "source": source,
+                "output": output,
+                "details": details,
+            }
+        )
+        self._refresh_results_table(scroll_to_end=True)
+
+    def _clear_log(self) -> None:
+        self.result_rows.clear()
+        self._refresh_results_table()
+
+    def _status_tag(self, status: str) -> str:
+        return {
             "OK": "ok",
             "FAILED": "failed",
             "ERROR": "error",
             "INFO": "info",
-        }.get(normalized_status, "info")
-        item_id = self.results_table.insert(
-            "",
-            "end",
-            values=(status, source, output, details),
-            tags=(tag,),
-        )
-        self.results_table.see(item_id)
+        }.get(status.upper(), "info")
 
-    def _clear_log(self) -> None:
+    def _status_symbol(self, status: str) -> str:
+        return {
+            "OK": "✓ Success",
+            "FAILED": "✗ Failed",
+            "ERROR": "! Error",
+            "INFO": "• Info",
+        }.get(status.upper(), status)
+
+    def _sort_value(self, row: dict[str, str], column: str) -> tuple[int, str]:
+        status_rank = {
+            "ERROR": 0,
+            "FAILED": 1,
+            "INFO": 2,
+            "OK": 3,
+        }
+        if column == "status":
+            return (status_rank.get(row["status"].upper(), 99), row["status"].lower())
+        return (0, row[column].lower())
+
+    def _filtered_rows(self) -> list[dict[str, str]]:
+        if not self.failures_only_var.get():
+            return list(self.result_rows)
+        return [
+            row
+            for row in self.result_rows
+            if row["status"].upper() in {"FAILED", "ERROR"}
+        ]
+
+    def _update_summary_text(self, shown_rows: list[dict[str, str]]) -> None:
+        total = len(self.result_rows)
+        shown = len(shown_rows)
+        failed = sum(
+            1 for row in self.result_rows if row["status"].upper() in {"FAILED", "ERROR"}
+        )
+        self.summary_var.set(
+            f"Showing {shown} of {total} items  |  Failures: {failed}"
+        )
+
+    def _refresh_heading_labels(self) -> None:
+        labels = {
+            "status": "Status",
+            "source": "Source",
+            "output": "Output",
+            "details": "Details",
+        }
+        arrow = " ↓" if self.sort_descending else " ↑"
+        for column, label in labels.items():
+            heading = label + arrow if column == self.sort_column else label
+            self.results_table.heading(
+                column,
+                text=heading,
+                command=lambda col=column: self._sort_results_by(col),
+            )
+
+    def _refresh_results_table(self, scroll_to_end: bool = False) -> None:
         for item in self.results_table.get_children():
             self.results_table.delete(item)
+
+        rows = self._filtered_rows()
+        rows.sort(
+            key=lambda row: self._sort_value(row, self.sort_column),
+            reverse=self.sort_descending,
+        )
+
+        last_item_id = None
+        for row in rows:
+            item_id = self.results_table.insert(
+                "",
+                "end",
+                values=(
+                    self._status_symbol(row["status"]),
+                    row["source"],
+                    row["output"],
+                    row["details"],
+                ),
+                tags=(self._status_tag(row["status"]),),
+            )
+            last_item_id = item_id
+
+        if scroll_to_end and last_item_id is not None:
+            self.results_table.see(last_item_id)
+
+        self._refresh_heading_labels()
+        self._update_summary_text(rows)
+
+    def _sort_results_by(self, column: str) -> None:
+        if self.sort_column == column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column = column
+            self.sort_descending = False
+        self._refresh_results_table()
 
     def _selected_item_id(self) -> str | None:
         selection = self.results_table.selection()
@@ -760,7 +888,14 @@ class WordToPdfApp:
         values = self.results_table.item(item_id, "values")
         if len(values) != 4:
             return None
-        return tuple(str(value) for value in values)
+        status, source, output, details = (str(value) for value in values)
+        status = (
+            status.replace("✓ ", "")
+            .replace("✗ ", "")
+            .replace("! ", "")
+            .replace("• ", "")
+        )
+        return status, source, output, details
 
     def _copy_text(self, text: str, success_message: str) -> None:
         if not text or text == "-":
