@@ -301,9 +301,15 @@ class WordToPdfApp:
     def _apply_styles(self) -> None:
         style = ttk.Style()
         try:
-            style.theme_use("clam")
+            style.theme_use("vista")
         except tk.TclError:
-            pass
+            try:
+                style.theme_use("xpnative")
+            except tk.TclError:
+                try:
+                    style.theme_use("default")
+                except tk.TclError:
+                    pass
 
         self.colors = {
             "bg": "#f3f5f7",
