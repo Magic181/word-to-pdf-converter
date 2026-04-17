@@ -299,19 +299,19 @@ class WordToPdfApp:
             pass
 
         self.colors = {
-            "bg": "#eef3f1",
-            "panel": "#f8fbfa",
+            "bg": "#f3f5f7",
+            "panel": "#f7f8fa",
             "card": "#ffffff",
-            "hero": "#163832",
-            "hero_accent": "#6dd6b5",
-            "text": "#10221d",
-            "muted": "#5f746d",
-            "border": "#d6e3de",
+            "hero": "#e9edf2",
+            "hero_accent": "#c9d2dc",
+            "text": "#17212b",
+            "muted": "#66717d",
+            "border": "#d8dee6",
             "input": "#fdfefe",
-            "primary": "#1f7a64",
-            "primary_active": "#18614f",
-            "secondary": "#e8f1ee",
-            "secondary_active": "#d9e8e2",
+            "primary": "#244a73",
+            "primary_active": "#1d3a59",
+            "secondary": "#eef2f6",
+            "secondary_active": "#e2e8ef",
         }
 
         style.configure(".", font=("Segoe UI", 10))
@@ -392,9 +392,9 @@ class WordToPdfApp:
         )
         style.configure(
             "App.Horizontal.TProgressbar",
-            troughcolor="#dce9e4",
+            troughcolor="#dfe5ec",
             background=self.colors["primary"],
-            bordercolor="#dce9e4",
+            bordercolor="#dfe5ec",
             lightcolor=self.colors["primary"],
             darkcolor=self.colors["primary"],
             thickness=10,
@@ -405,7 +405,14 @@ class WordToPdfApp:
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
 
-        hero = tk.Frame(container, bg=self.colors["hero"], padx=28, pady=24)
+        hero = tk.Frame(
+            container,
+            bg=self.colors["hero"],
+            padx=28,
+            pady=22,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
         hero.pack(fill="x")
 
         hero_top = tk.Frame(hero, bg=self.colors["hero"])
@@ -414,29 +421,40 @@ class WordToPdfApp:
             hero_top,
             text="Word to PDF Converter",
             font=("Segoe UI Semibold", 22),
-            fg="#ffffff",
+            fg=self.colors["text"],
             bg=self.colors["hero"],
         ).pack(anchor="w")
         tk.Label(
             hero_top,
-            text="Clean local conversion for one file or a whole directory.",
+            text="A desktop utility for reliable Word-to-PDF conversion in office workflows.",
             font=("Segoe UI", 10),
-            fg="#c9ded7",
+            fg=self.colors["muted"],
             bg=self.colors["hero"],
         ).pack(anchor="w", pady=(6, 0))
 
-        badge_row = tk.Frame(hero, bg=self.colors["hero"])
-        badge_row.pack(anchor="w", pady=(16, 0))
-        for text in ("Windows + Word", "Single File", "Batch Folder"):
-            tk.Label(
-                badge_row,
-                text=text,
-                font=("Segoe UI Semibold", 9),
-                fg=self.colors["hero"],
-                bg=self.colors["hero_accent"],
-                padx=10,
-                pady=4,
-            ).pack(side="left", padx=(0, 8))
+        meta_row = tk.Frame(hero, bg=self.colors["hero"])
+        meta_row.pack(anchor="w", pady=(14, 0))
+        tk.Label(
+            meta_row,
+            text="Windows + Microsoft Word required",
+            font=("Segoe UI", 9),
+            fg=self.colors["muted"],
+            bg=self.colors["hero"],
+        ).pack(side="left")
+        tk.Label(
+            meta_row,
+            text="  |  ",
+            font=("Segoe UI", 9),
+            fg=self.colors["hero_accent"],
+            bg=self.colors["hero"],
+        ).pack(side="left")
+        tk.Label(
+            meta_row,
+            text="Single-file and batch conversion",
+            font=("Segoe UI", 9),
+            fg=self.colors["muted"],
+            bg=self.colors["hero"],
+        ).pack(side="left")
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
@@ -593,7 +611,7 @@ class WordToPdfApp:
             state="disabled",
             bd=0,
             relief="flat",
-            bg="#f4f8f7",
+            bg="#f7f9fb",
             fg=self.colors["text"],
             insertbackground=self.colors["text"],
             padx=12,
