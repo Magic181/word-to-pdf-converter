@@ -1,83 +1,86 @@
-# wp_transform
+# Word to PDF Converter
 
-`wp_transform` 是一个在 Windows 本机上运行的 Python 命令行工具，用来把 Word 文档导出为 PDF。
+A lightweight Windows CLI tool for converting Word documents to PDF with high layout fidelity.
 
-## 功能
+This project uses `pywin32` to automate a locally installed Microsoft Word instance and export `.doc` or `.docx` files to PDF. For personal desktop use on Windows, this is usually one of the most reliable ways to preserve pagination, fonts, headers, footers, and overall document layout.
 
-- 输入 `.doc` 或 `.docx` 文件路径
-- 输出对应的 `.pdf` 文件
-- 默认导出到源文件同目录
-- 支持通过参数指定输出路径
-- 支持覆盖已有 PDF
+## Features
 
-## 原理
+- Convert `.doc` and `.docx` files to PDF
+- Use the source filename by default and export beside the original document
+- Support custom output paths
+- Support overwriting an existing PDF
+- Keep formatting by relying on Microsoft Word's native export
 
-工具通过 `pywin32` 调用本机安装的 Microsoft Word，使用 `ExportAsFixedFormat` 导出 PDF。  
-这种方式通常比纯解析库更能保留原始排版、字体、页眉页脚和分页效果。
-
-## 环境要求
+## Requirements
 
 - Windows
-- Python 3.10+
-- 已安装 Microsoft Word
+- Python 3.10 or newer
+- Microsoft Word installed locally
 
-## 安装
+## Installation
 
-方式一：
+Install dependencies directly:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-方式二：
+Or install the project as a command-line tool:
 
 ```bash
 pip install .
 ```
 
-## 用法
+## Usage
 
-直接运行脚本：
+Run the script directly:
 
 ```bash
 python main.py "D:\docs\example.docx"
 ```
 
-安装后使用命令：
+Run the installed command:
 
 ```bash
 wp-transform "D:\docs\example.docx"
 ```
 
-指定输出文件：
+Specify an output PDF path:
 
 ```bash
 wp-transform "D:\docs\example.docx" -o "D:\output\example.pdf"
 ```
 
-覆盖已有文件：
+Overwrite an existing PDF:
 
 ```bash
 wp-transform "D:\docs\example.docx" --overwrite
 ```
 
-## 示例输出
+## Example Output
 
 ```text
 Converted successfully: D:\docs\example.pdf
 ```
 
-## 说明
+## Notes
 
-- 如果没有安装 Microsoft Word，转换会失败。
-- 这是一个适合个人电脑本地使用的方案，不适合无 Office 环境的服务器。
+- If Microsoft Word is not installed, conversion will fail.
+- This tool is designed for local desktop use, not for headless servers.
+- The conversion quality depends on Word being able to open the source document normally.
 
-## GitHub 上传建议
+## Project Structure
 
-如果你要上传到 GitHub，推荐至少执行以下命令：
-
-```bash
-git init
-git add .
-git commit -m "feat: add Word to PDF CLI tool"
+```text
+.
+├── main.py
+├── pyproject.toml
+├── requirements.txt
+├── README.md
+└── 需求.md
 ```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
