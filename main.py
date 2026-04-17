@@ -270,8 +270,8 @@ class WordToPdfApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Word to PDF Converter")
-        self.root.geometry("960x680")
-        self.root.minsize(860, 620)
+        self.root.geometry("1140x760")
+        self.root.minsize(1000, 700)
         self.root.configure(bg="#eef3f1")
 
         self.mode_var = tk.StringVar(value="file")
@@ -401,11 +401,11 @@ class WordToPdfApp:
         )
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=22, style="App.TFrame")
+        container = ttk.Frame(self.root, padding=28, style="App.TFrame")
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
 
-        hero = tk.Frame(container, bg=self.colors["hero"], padx=24, pady=20)
+        hero = tk.Frame(container, bg=self.colors["hero"], padx=28, pady=24)
         hero.pack(fill="x")
 
         hero_top = tk.Frame(hero, bg=self.colors["hero"])
@@ -413,7 +413,7 @@ class WordToPdfApp:
         tk.Label(
             hero_top,
             text="Word to PDF Converter",
-            font=("Segoe UI Semibold", 20),
+            font=("Segoe UI Semibold", 22),
             fg="#ffffff",
             bg=self.colors["hero"],
         ).pack(anchor="w")
@@ -439,13 +439,13 @@ class WordToPdfApp:
             ).pack(side="left", padx=(0, 8))
 
         body = ttk.Frame(container, style="App.TFrame")
-        body.pack(fill="both", expand=True, pady=(18, 0))
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
+        body.pack(fill="both", expand=True, pady=(22, 0))
+        body.columnconfigure(0, weight=11)
+        body.columnconfigure(1, weight=8)
         body.rowconfigure(1, weight=1)
 
         left_column = ttk.Frame(body, style="App.TFrame")
-        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 14))
+        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 18))
         left_column.columnconfigure(0, weight=1)
 
         right_column = ttk.Frame(body, style="App.TFrame")
@@ -453,7 +453,7 @@ class WordToPdfApp:
         right_column.columnconfigure(0, weight=1)
         right_column.rowconfigure(1, weight=1)
 
-        mode_frame = ttk.LabelFrame(left_column, text="Mode", padding=16, style="Card.TLabelframe")
+        mode_frame = ttk.LabelFrame(left_column, text="Mode", padding=20, style="Card.TLabelframe")
         mode_frame.pack(fill="x")
 
         ttk.Radiobutton(
@@ -480,8 +480,8 @@ class WordToPdfApp:
         )
         mode_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        path_frame = ttk.LabelFrame(left_column, text="Paths", padding=16, style="Card.TLabelframe")
-        path_frame.pack(fill="x", pady=(14, 0))
+        path_frame = ttk.LabelFrame(left_column, text="Paths", padding=20, style="Card.TLabelframe")
+        path_frame.pack(fill="x", pady=(16, 0))
         path_frame.columnconfigure(1, weight=1)
 
         ttk.Label(path_frame, text="Input", style="Body.TLabel").grid(
@@ -517,8 +517,8 @@ class WordToPdfApp:
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        options_frame = ttk.LabelFrame(left_column, text="Options", padding=16, style="Card.TLabelframe")
-        options_frame.pack(fill="x", pady=(14, 0))
+        options_frame = ttk.LabelFrame(left_column, text="Options", padding=20, style="Card.TLabelframe")
+        options_frame.pack(fill="x", pady=(16, 0))
 
         self.recursive_check = ttk.Checkbutton(
             options_frame,
@@ -534,7 +534,7 @@ class WordToPdfApp:
             style="App.TCheckbutton",
         ).grid(row=0, column=1, sticky="w", padx=(22, 0))
 
-        action_frame = ttk.Frame(left_column, padding=(0, 14, 0, 0), style="App.TFrame")
+        action_frame = ttk.Frame(left_column, padding=(0, 18, 0, 0), style="App.TFrame")
         action_frame.pack(fill="x")
 
         self.start_button = ttk.Button(
@@ -554,7 +554,7 @@ class WordToPdfApp:
             side="left", padx=(10, 0)
         )
 
-        progress_frame = ttk.LabelFrame(right_column, text="Progress", padding=16, style="Card.TLabelframe")
+        progress_frame = ttk.LabelFrame(right_column, text="Progress", padding=20, style="Card.TLabelframe")
         progress_frame.grid(row=0, column=0, sticky="ew")
 
         self.progress = ttk.Progressbar(
@@ -579,15 +579,15 @@ class WordToPdfApp:
             font=("Segoe UI", 9),
             fg=self.colors["muted"],
             bg=self.colors["card"],
-            wraplength=300,
+            wraplength=360,
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
-        log_frame = ttk.LabelFrame(right_column, text="Activity Log", padding=16, style="Card.TLabelframe")
-        log_frame.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+        log_frame = ttk.LabelFrame(right_column, text="Activity Log", padding=20, style="Card.TLabelframe")
+        log_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
-            height=18,
+            height=22,
             wrap="word",
             font=("Consolas", 10),
             state="disabled",
