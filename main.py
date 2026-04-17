@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
 try:
+    import pythoncom  # type: ignore[import]
     import win32com.client  # type: ignore[import]
     from pywintypes import com_error  # type: ignore[import]
 except ImportError:  # pragma: no cover - handled at runtime for missing dependency
+    pythoncom = None
     win32com = None
     com_error = Exception
 
 
 WD_EXPORT_FORMAT_PDF = 17
+WD_DO_NOT_SAVE_CHANGES = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +57,7 @@ def resolve_paths(input_path: str, output_path: str | None) -> tuple[Path, Path]
 
 
 def ensure_dependencies() -> None:
-    if win32com is None:
+    if pythoncom is None or win32com is None:
         raise RuntimeError(
             "Missing dependency: pywin32. Install it with `pip install -r requirements.txt`."
         )
@@ -70,12 +74,19 @@ def convert_word_to_pdf(source: Path, target: Path, overwrite: bool = False) -> 
     target.parent.mkdir(parents=True, exist_ok=True)
     word = None
     document = None
+    pythoncom.CoInitialize()
     try:
         word = win32com.client.DispatchEx("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
 
-        document = word.Documents.Open(str(source), ReadOnly=True)
+        document = word.Documents.Open(
+            str(source),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
+        )
         document.ExportAsFixedFormat(
             OutputFileName=str(target),
             ExportFormat=WD_EXPORT_FORMAT_PDF,
@@ -96,9 +107,17 @@ def convert_word_to_pdf(source: Path, target: Path, overwrite: bool = False) -> 
         ) from exc
     finally:
         if document is not None:
-            document.Close(False)
+            try:
+                document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+            finally:
+                document = None
         if word is not None:
-            word.Quit()
+            try:
+                word.Quit()
+            finally:
+                word = None
+        gc.collect()
+        pythoncom.CoUninitialize()
 
     if not target.exists():
         raise RuntimeError(f"Export did not create the PDF file: {target}")
