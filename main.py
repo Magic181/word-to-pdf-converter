@@ -611,23 +611,44 @@ class WordToPdfApp:
 
         action_frame = ttk.Frame(self.left_column, padding=(0, 18, 0, 0), style="App.TFrame")
         action_frame.pack(fill="x")
+        action_frame.columnconfigure(0, weight=1)
+        action_frame.columnconfigure(1, weight=1)
 
-        self.start_button = ttk.Button(
+        self.start_button = tk.Button(
             action_frame,
             text="Start Conversion",
             command=self._start_conversion,
-            style="Primary.TButton",
+            font=("Segoe UI Semibold", 10),
+            fg="#ffffff",
+            bg=self.colors["primary"],
+            activeforeground="#ffffff",
+            activebackground=self.colors["primary_active"],
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=11,
+            cursor="hand2",
         )
-        self.start_button.pack(side="left")
+        self.start_button.grid(row=0, column=0, sticky="ew")
 
-        ttk.Button(
+        self.clear_button = tk.Button(
             action_frame,
-            text="Clear Log",
+            text="Clear Results",
             command=self._clear_log,
-            style="Secondary.TButton",
-        ).pack(
-            side="left", padx=(10, 0)
+            font=("Segoe UI", 10),
+            fg=self.colors["text"],
+            bg=self.colors["secondary"],
+            activeforeground=self.colors["text"],
+            activebackground=self.colors["secondary_active"],
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=11,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
         )
+        self.clear_button.grid(row=0, column=1, sticky="ew", padx=(12, 0))
 
         progress_frame = ttk.LabelFrame(self.right_column, text="Progress", padding=20, style="Card.TLabelframe")
         progress_frame.grid(row=0, column=0, sticky="ew")
@@ -992,10 +1013,22 @@ class WordToPdfApp:
 
     def _set_running_state(self, running: bool) -> None:
         if running:
-            self.start_button.state(["disabled"])
+            self.start_button.configure(
+                state="disabled",
+                bg="#8aa0ba",
+                disabledforeground="#eef3f8",
+                cursor="arrow",
+            )
             self.status_var.set("Converting... please keep Word available in the background.")
         else:
-            self.start_button.state(["!disabled"])
+            self.start_button.configure(
+                state="normal",
+                bg=self.colors["primary"],
+                fg="#ffffff",
+                activebackground=self.colors["primary_active"],
+                activeforeground="#ffffff",
+                cursor="hand2",
+            )
 
     def _start_conversion(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
