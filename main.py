@@ -270,8 +270,9 @@ class WordToPdfApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Word to PDF Converter")
-        self.root.geometry("860x620")
-        self.root.minsize(760, 560)
+        self.root.geometry("960x680")
+        self.root.minsize(860, 620)
+        self.root.configure(bg="#eef3f1")
 
         self.mode_var = tk.StringVar(value="file")
         self.input_var = tk.StringVar()
@@ -285,35 +286,174 @@ class WordToPdfApp:
         self.worker_thread: threading.Thread | None = None
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
+        self._apply_styles()
         self._build_ui()
         self._toggle_mode()
         self.root.after(150, self._poll_events)
 
-    def _build_ui(self) -> None:
+    def _apply_styles(self) -> None:
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
 
-        container = ttk.Frame(self.root, padding=18)
+        self.colors = {
+            "bg": "#eef3f1",
+            "panel": "#f8fbfa",
+            "card": "#ffffff",
+            "hero": "#163832",
+            "hero_accent": "#6dd6b5",
+            "text": "#10221d",
+            "muted": "#5f746d",
+            "border": "#d6e3de",
+            "input": "#fdfefe",
+            "primary": "#1f7a64",
+            "primary_active": "#18614f",
+            "secondary": "#e8f1ee",
+            "secondary_active": "#d9e8e2",
+        }
+
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("App.TFrame", background=self.colors["bg"])
+        style.configure("Card.TFrame", background=self.colors["card"])
+        style.configure(
+            "Card.TLabelframe",
+            background=self.colors["card"],
+            bordercolor=self.colors["border"],
+            relief="solid",
+            borderwidth=1,
+            padding=0,
+        )
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+            font=("Segoe UI Semibold", 10),
+        )
+        style.configure(
+            "Body.TLabel",
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+        )
+        style.configure(
+            "Muted.TLabel",
+            background=self.colors["card"],
+            foreground=self.colors["muted"],
+        )
+        style.configure(
+            "Primary.TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(16, 10),
+            foreground="#ffffff",
+            background=self.colors["primary"],
+            borderwidth=0,
+            focusthickness=0,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[
+                ("disabled", "#94b9ae"),
+                ("active", self.colors["primary_active"]),
+            ],
+            foreground=[("disabled", "#f3f7f5")],
+        )
+        style.configure(
+            "Secondary.TButton",
+            padding=(14, 10),
+            foreground=self.colors["text"],
+            background=self.colors["secondary"],
+            borderwidth=0,
+            focusthickness=0,
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", self.colors["secondary_active"])],
+        )
+        style.configure(
+            "App.TRadiobutton",
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10),
+        )
+        style.map(
+            "App.TRadiobutton",
+            background=[("active", self.colors["card"])],
+        )
+        style.configure(
+            "App.TCheckbutton",
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10),
+        )
+        style.map(
+            "App.TCheckbutton",
+            background=[("active", self.colors["card"])],
+        )
+        style.configure(
+            "App.Horizontal.TProgressbar",
+            troughcolor="#dce9e4",
+            background=self.colors["primary"],
+            bordercolor="#dce9e4",
+            lightcolor=self.colors["primary"],
+            darkcolor=self.colors["primary"],
+            thickness=10,
+        )
+
+    def _build_ui(self) -> None:
+        container = ttk.Frame(self.root, padding=22, style="App.TFrame")
         container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
 
-        header = ttk.Label(
-            container,
+        hero = tk.Frame(container, bg=self.colors["hero"], padx=24, pady=20)
+        hero.pack(fill="x")
+
+        hero_top = tk.Frame(hero, bg=self.colors["hero"])
+        hero_top.pack(fill="x")
+        tk.Label(
+            hero_top,
             text="Word to PDF Converter",
-            font=("Segoe UI", 18, "bold"),
-        )
-        header.pack(anchor="w")
+            font=("Segoe UI Semibold", 20),
+            fg="#ffffff",
+            bg=self.colors["hero"],
+        ).pack(anchor="w")
+        tk.Label(
+            hero_top,
+            text="Clean local conversion for one file or a whole directory.",
+            font=("Segoe UI", 10),
+            fg="#c9ded7",
+            bg=self.colors["hero"],
+        ).pack(anchor="w", pady=(6, 0))
 
-        subtitle = ttk.Label(
-            container,
-            text="Single-file conversion and batch directory export in one desktop tool.",
-            foreground="#4b5563",
-        )
-        subtitle.pack(anchor="w", pady=(4, 16))
+        badge_row = tk.Frame(hero, bg=self.colors["hero"])
+        badge_row.pack(anchor="w", pady=(16, 0))
+        for text in ("Windows + Word", "Single File", "Batch Folder"):
+            tk.Label(
+                badge_row,
+                text=text,
+                font=("Segoe UI Semibold", 9),
+                fg=self.colors["hero"],
+                bg=self.colors["hero_accent"],
+                padx=10,
+                pady=4,
+            ).pack(side="left", padx=(0, 8))
 
-        mode_frame = ttk.LabelFrame(container, text="Mode", padding=12)
+        body = ttk.Frame(container, style="App.TFrame")
+        body.pack(fill="both", expand=True, pady=(18, 0))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(1, weight=1)
+
+        left_column = ttk.Frame(body, style="App.TFrame")
+        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 14))
+        left_column.columnconfigure(0, weight=1)
+
+        right_column = ttk.Frame(body, style="App.TFrame")
+        right_column.grid(row=0, column=1, rowspan=2, sticky="nsew")
+        right_column.columnconfigure(0, weight=1)
+        right_column.rowconfigure(1, weight=1)
+
+        mode_frame = ttk.LabelFrame(left_column, text="Mode", padding=16, style="Card.TLabelframe")
         mode_frame.pack(fill="x")
 
         ttk.Radiobutton(
@@ -322,6 +462,7 @@ class WordToPdfApp:
             value="file",
             variable=self.mode_var,
             command=self._toggle_mode,
+            style="App.TRadiobutton",
         ).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(
             mode_frame,
@@ -329,74 +470,134 @@ class WordToPdfApp:
             value="directory",
             variable=self.mode_var,
             command=self._toggle_mode,
-        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+            style="App.TRadiobutton",
+        ).grid(row=0, column=1, sticky="w", padx=(22, 0))
 
-        path_frame = ttk.LabelFrame(container, text="Paths", padding=12)
+        mode_hint = ttk.Label(
+            mode_frame,
+            text="Use batch mode when you want to convert every Word file inside a folder.",
+            style="Muted.TLabel",
+        )
+        mode_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        path_frame = ttk.LabelFrame(left_column, text="Paths", padding=16, style="Card.TLabelframe")
         path_frame.pack(fill="x", pady=(14, 0))
         path_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(path_frame, text="Input").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(path_frame, text="Input", style="Body.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
         self.input_entry = ttk.Entry(path_frame, textvariable=self.input_var)
-        self.input_entry.grid(row=0, column=1, sticky="ew", padx=(10, 10), pady=4)
-        ttk.Button(path_frame, text="Browse", command=self._browse_input).grid(
-            row=0, column=2, sticky="ew", pady=4
+        self.input_entry.grid(row=0, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
+        ttk.Button(
+            path_frame,
+            text="Browse",
+            command=self._browse_input,
+            style="Secondary.TButton",
+        ).grid(
+            row=0, column=2, sticky="ew", pady=(0, 8)
         )
 
-        self.output_label = ttk.Label(path_frame, text="Output")
-        self.output_label.grid(row=1, column=0, sticky="w", pady=4)
+        self.output_label = ttk.Label(path_frame, text="Output", style="Body.TLabel")
+        self.output_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
         self.output_entry = ttk.Entry(path_frame, textvariable=self.output_var)
-        self.output_entry.grid(row=1, column=1, sticky="ew", padx=(10, 10), pady=4)
-        ttk.Button(path_frame, text="Browse", command=self._browse_output).grid(
-            row=1, column=2, sticky="ew", pady=4
+        self.output_entry.grid(row=1, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
+        ttk.Button(
+            path_frame,
+            text="Browse",
+            command=self._browse_output,
+            style="Secondary.TButton",
+        ).grid(
+            row=1, column=2, sticky="ew", pady=(0, 8)
         )
 
-        options_frame = ttk.LabelFrame(container, text="Options", padding=12)
+        ttk.Label(
+            path_frame,
+            text="Leave output empty to export beside the source file or folder.",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        options_frame = ttk.LabelFrame(left_column, text="Options", padding=16, style="Card.TLabelframe")
         options_frame.pack(fill="x", pady=(14, 0))
 
         self.recursive_check = ttk.Checkbutton(
             options_frame,
             text="Include subdirectories",
             variable=self.recursive_var,
+            style="App.TCheckbutton",
         )
         self.recursive_check.grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(
             options_frame,
             text="Overwrite existing PDF files",
             variable=self.overwrite_var,
-        ).grid(row=0, column=1, sticky="w", padx=(20, 0))
+            style="App.TCheckbutton",
+        ).grid(row=0, column=1, sticky="w", padx=(22, 0))
 
-        action_frame = ttk.Frame(container)
-        action_frame.pack(fill="x", pady=(14, 0))
+        action_frame = ttk.Frame(left_column, padding=(0, 14, 0, 0), style="App.TFrame")
+        action_frame.pack(fill="x")
 
         self.start_button = ttk.Button(
-            action_frame, text="Start Conversion", command=self._start_conversion
+            action_frame,
+            text="Start Conversion",
+            command=self._start_conversion,
+            style="Primary.TButton",
         )
         self.start_button.pack(side="left")
 
-        ttk.Button(action_frame, text="Clear Log", command=self._clear_log).pack(
+        ttk.Button(
+            action_frame,
+            text="Clear Log",
+            command=self._clear_log,
+            style="Secondary.TButton",
+        ).pack(
             side="left", padx=(10, 0)
         )
 
+        progress_frame = ttk.LabelFrame(right_column, text="Progress", padding=16, style="Card.TLabelframe")
+        progress_frame.grid(row=0, column=0, sticky="ew")
+
         self.progress = ttk.Progressbar(
-            container,
+            progress_frame,
             mode="determinate",
             maximum=100,
             variable=self.progress_var,
+            style="App.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(14, 0))
+        self.progress.pack(fill="x")
 
-        ttk.Label(container, textvariable=self.status_var).pack(
-            anchor="w", pady=(8, 0)
+        self.status_label = ttk.Label(
+            progress_frame,
+            textvariable=self.status_var,
+            style="Muted.TLabel",
         )
+        self.status_label.pack(anchor="w", pady=(10, 0))
 
-        log_frame = ttk.LabelFrame(container, text="Log", padding=12)
-        log_frame.pack(fill="both", expand=True, pady=(14, 0))
+        tk.Label(
+            progress_frame,
+            text="Tip: batch mode preserves the relative folder structure in the output directory.",
+            font=("Segoe UI", 9),
+            fg=self.colors["muted"],
+            bg=self.colors["card"],
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w", pady=(12, 0))
+
+        log_frame = ttk.LabelFrame(right_column, text="Activity Log", padding=16, style="Card.TLabelframe")
+        log_frame.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
             height=18,
             wrap="word",
             font=("Consolas", 10),
             state="disabled",
+            bd=0,
+            relief="flat",
+            bg="#f4f8f7",
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            padx=12,
+            pady=12,
         )
         self.log_text.pack(fill="both", expand=True)
 
@@ -448,6 +649,7 @@ class WordToPdfApp:
     def _set_running_state(self, running: bool) -> None:
         if running:
             self.start_button.state(["disabled"])
+            self.status_var.set("Converting... please keep Word available in the background.")
         else:
             self.start_button.state(["!disabled"])
 
