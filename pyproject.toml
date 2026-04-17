@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wp-transform"
+version = "0.1.0"
+description = "A Windows CLI tool for converting Word documents to PDF."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pywin32>=306",
+]
+
+[project.scripts]
+wp-transform = "main:main"
