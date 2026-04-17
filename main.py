@@ -360,28 +360,44 @@ class WordToPdfApp:
             padding=(16, 10),
             foreground="#ffffff",
             background=self.colors["primary"],
-            borderwidth=0,
-            focusthickness=0,
+            borderwidth=1,
+            focusthickness=1,
+            focuscolor=self.colors["primary"],
+            relief="flat",
         )
         style.map(
             "Primary.TButton",
             background=[
                 ("disabled", "#94b9ae"),
                 ("active", self.colors["primary_active"]),
+                ("pressed", self.colors["primary_active"]),
             ],
-            foreground=[("disabled", "#f3f7f5")],
+            foreground=[
+                ("disabled", "#f3f7f5"),
+                ("active", "#ffffff"),
+                ("pressed", "#ffffff"),
+            ],
         )
         style.configure(
             "Secondary.TButton",
             padding=(14, 10),
             foreground=self.colors["text"],
             background=self.colors["secondary"],
-            borderwidth=0,
-            focusthickness=0,
+            borderwidth=1,
+            focusthickness=1,
+            focuscolor=self.colors["secondary"],
+            relief="flat",
         )
         style.map(
             "Secondary.TButton",
-            background=[("active", self.colors["secondary_active"])],
+            background=[
+                ("active", self.colors["secondary_active"]),
+                ("pressed", self.colors["secondary_active"]),
+            ],
+            foreground=[
+                ("active", self.colors["text"]),
+                ("pressed", self.colors["text"]),
+            ],
         )
         style.configure(
             "App.TRadiobutton",
