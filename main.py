@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import queue
 import sys
 import threading
@@ -288,6 +289,7 @@ class WordToPdfApp:
 
         self._apply_styles()
         self._build_ui()
+        self._build_context_menu()
         self._toggle_mode()
         self.root.after(150, self._poll_events)
 
@@ -645,6 +647,12 @@ class WordToPdfApp:
         self.results_table.column("output", width=210, minwidth=160, anchor="w")
         self.results_table.column("details", width=260, minwidth=220, anchor="w")
         self.results_table.grid(row=0, column=0, sticky="nsew")
+        self.results_table.tag_configure("ok", background="#edf7f2", foreground="#1d5d43")
+        self.results_table.tag_configure("failed", background="#fbefef", foreground="#8a2f2f")
+        self.results_table.tag_configure("error", background="#fff4e8", foreground="#8c4b1f")
+        self.results_table.tag_configure("info", background="#f6f8fb", foreground=self.colors["text"])
+        self.results_table.bind("<Double-1>", self._handle_row_double_click)
+        self.results_table.bind("<Button-3>", self._show_context_menu)
 
         table_scroll_y = ttk.Scrollbar(
             log_frame, orient="vertical", command=self.results_table.yview
@@ -657,6 +665,26 @@ class WordToPdfApp:
         )
         table_scroll_x.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         self.results_table.configure(xscrollcommand=table_scroll_x.set)
+
+    def _build_context_menu(self) -> None:
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(
+            label="Open Output Folder",
+            command=self._open_selected_output_folder,
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
+            label="Copy Source Path",
+            command=lambda: self._copy_selected_path("source"),
+        )
+        self.context_menu.add_command(
+            label="Copy Output Path",
+            command=lambda: self._copy_selected_path("output"),
+        )
+        self.context_menu.add_command(
+            label="Copy Details",
+            command=lambda: self._copy_selected_path("details"),
+        )
 
     def _toggle_mode(self) -> None:
         directory_mode = self.mode_var.get() == "directory"
@@ -699,16 +727,107 @@ class WordToPdfApp:
         output: str,
         details: str,
     ) -> None:
+        normalized_status = status.upper()
+        tag = {
+            "OK": "ok",
+            "FAILED": "failed",
+            "ERROR": "error",
+            "INFO": "info",
+        }.get(normalized_status, "info")
         item_id = self.results_table.insert(
             "",
             "end",
             values=(status, source, output, details),
+            tags=(tag,),
         )
         self.results_table.see(item_id)
 
     def _clear_log(self) -> None:
         for item in self.results_table.get_children():
             self.results_table.delete(item)
+
+    def _selected_item_id(self) -> str | None:
+        selection = self.results_table.selection()
+        if selection:
+            return selection[0]
+        focused = self.results_table.focus()
+        return focused or None
+
+    def _selected_row_values(self) -> tuple[str, str, str, str] | None:
+        item_id = self._selected_item_id()
+        if not item_id:
+            return None
+        values = self.results_table.item(item_id, "values")
+        if len(values) != 4:
+            return None
+        return tuple(str(value) for value in values)
+
+    def _copy_text(self, text: str, success_message: str) -> None:
+        if not text or text == "-":
+            self.status_var.set("No path is available for the selected row.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.status_var.set(success_message)
+
+    def _copy_selected_path(self, field: str) -> None:
+        values = self._selected_row_values()
+        if values is None:
+            self.status_var.set("Select a result row first.")
+            return
+
+        status, source, output, details = values
+        mapping = {
+            "source": (source, "Source path copied."),
+            "output": (output, "Output path copied."),
+            "details": (details, "Details copied."),
+        }
+        text, success_message = mapping[field]
+        self._copy_text(text, success_message)
+
+    def _open_selected_output_folder(self) -> None:
+        values = self._selected_row_values()
+        if values is None:
+            self.status_var.set("Select a result row first.")
+            return
+
+        _, _, output, _ = values
+        if not output or output == "-":
+            self.status_var.set("No output path is available for the selected row.")
+            return
+
+        output_path = Path(output)
+        folder = output_path.parent if output_path.suffix else output_path
+        if not folder.exists():
+            self.status_var.set("Output folder does not exist yet.")
+            return
+
+        try:
+            os.startfile(str(folder))
+            self.status_var.set(f"Opened output folder: {folder}")
+        except OSError as exc:
+            self.status_var.set(f"Unable to open output folder: {exc}")
+
+    def _handle_row_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.results_table.identify_row(event.y)
+        if item_id:
+            self.results_table.selection_set(item_id)
+            self.results_table.focus(item_id)
+            self._open_selected_output_folder()
+
+    def _show_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.results_table.identify_row(event.y)
+        if item_id:
+            self.results_table.selection_set(item_id)
+            self.results_table.focus(item_id)
+
+        has_selection = self._selected_item_id() is not None
+        state = "normal" if has_selection else "disabled"
+        for index in (0, 2, 3, 4):
+            self.context_menu.entryconfigure(index, state=state)
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
 
     def _set_running_state(self, running: bool) -> None:
         if running:
