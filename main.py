@@ -489,21 +489,23 @@ class WordToPdfApp:
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
-        body.columnconfigure(0, weight=10)
-        body.columnconfigure(1, weight=9)
+        body.columnconfigure(0, weight=5, minsize=440)
+        body.columnconfigure(1, weight=7, minsize=700)
         body.rowconfigure(1, weight=1)
 
-        left_column = ttk.Frame(body, style="App.TFrame")
-        left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 20))
-        left_column.columnconfigure(0, weight=1)
+        self.left_column = ttk.Frame(body, style="App.TFrame")
+        self.left_column.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 20))
+        self.left_column.columnconfigure(0, weight=1)
 
-        right_column = ttk.Frame(body, style="App.TFrame")
-        right_column.grid(row=0, column=1, rowspan=2, sticky="nsew")
-        right_column.columnconfigure(0, weight=1)
-        right_column.rowconfigure(1, weight=1)
+        self.right_column = ttk.Frame(body, style="App.TFrame")
+        self.right_column.grid(row=0, column=1, rowspan=2, sticky="nsew")
+        self.right_column.columnconfigure(0, weight=1)
+        self.right_column.rowconfigure(1, weight=1)
 
-        mode_frame = ttk.LabelFrame(left_column, text="Mode", padding=20, style="Card.TLabelframe")
+        mode_frame = ttk.LabelFrame(self.left_column, text="Mode", padding=20, style="Card.TLabelframe")
         mode_frame.pack(fill="x")
+        mode_frame.columnconfigure(0, weight=1)
+        mode_frame.columnconfigure(1, weight=1)
 
         ttk.Radiobutton(
             mode_frame,
@@ -529,14 +531,14 @@ class WordToPdfApp:
         )
         mode_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        path_frame = ttk.LabelFrame(left_column, text="Paths", padding=20, style="Card.TLabelframe")
+        path_frame = ttk.LabelFrame(self.left_column, text="Paths", padding=20, style="Card.TLabelframe")
         path_frame.pack(fill="x", pady=(16, 0))
         path_frame.columnconfigure(1, weight=1)
 
         ttk.Label(path_frame, text="Input", style="Body.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        self.input_entry = ttk.Entry(path_frame, textvariable=self.input_var)
+        self.input_entry = ttk.Entry(path_frame, textvariable=self.input_var, width=36)
         self.input_entry.grid(row=0, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
         ttk.Button(
             path_frame,
@@ -549,7 +551,7 @@ class WordToPdfApp:
 
         self.output_label = ttk.Label(path_frame, text="Output", style="Body.TLabel")
         self.output_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
-        self.output_entry = ttk.Entry(path_frame, textvariable=self.output_var)
+        self.output_entry = ttk.Entry(path_frame, textvariable=self.output_var, width=36)
         self.output_entry.grid(row=1, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
         ttk.Button(
             path_frame,
@@ -566,8 +568,10 @@ class WordToPdfApp:
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        options_frame = ttk.LabelFrame(left_column, text="Options", padding=20, style="Card.TLabelframe")
+        options_frame = ttk.LabelFrame(self.left_column, text="Options", padding=20, style="Card.TLabelframe")
         options_frame.pack(fill="x", pady=(16, 0))
+        options_frame.columnconfigure(0, weight=1)
+        options_frame.columnconfigure(1, weight=1)
 
         self.recursive_check = ttk.Checkbutton(
             options_frame,
@@ -583,7 +587,7 @@ class WordToPdfApp:
             style="App.TCheckbutton",
         ).grid(row=0, column=1, sticky="w", padx=(22, 0))
 
-        action_frame = ttk.Frame(left_column, padding=(0, 18, 0, 0), style="App.TFrame")
+        action_frame = ttk.Frame(self.left_column, padding=(0, 18, 0, 0), style="App.TFrame")
         action_frame.pack(fill="x")
 
         self.start_button = ttk.Button(
@@ -603,7 +607,7 @@ class WordToPdfApp:
             side="left", padx=(10, 0)
         )
 
-        progress_frame = ttk.LabelFrame(right_column, text="Progress", padding=20, style="Card.TLabelframe")
+        progress_frame = ttk.LabelFrame(self.right_column, text="Progress", padding=20, style="Card.TLabelframe")
         progress_frame.grid(row=0, column=0, sticky="ew")
 
         self.progress = ttk.Progressbar(
@@ -632,7 +636,7 @@ class WordToPdfApp:
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
-        log_frame = ttk.LabelFrame(right_column, text="Results", padding=20, style="Card.TLabelframe")
+        log_frame = ttk.LabelFrame(self.right_column, text="Results", padding=20, style="Card.TLabelframe")
         log_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
@@ -674,10 +678,10 @@ class WordToPdfApp:
         self.results_table.heading(
             "details", text="Details", command=lambda: self._sort_results_by("details")
         )
-        self.results_table.column("status", width=110, minwidth=100, anchor="center", stretch=False)
-        self.results_table.column("source", width=270, minwidth=220, anchor="w")
-        self.results_table.column("output", width=270, minwidth=220, anchor="w")
-        self.results_table.column("details", width=380, minwidth=320, anchor="w")
+        self.results_table.column("status", width=120, minwidth=105, anchor="center", stretch=False)
+        self.results_table.column("source", width=220, minwidth=180, anchor="w")
+        self.results_table.column("output", width=220, minwidth=180, anchor="w")
+        self.results_table.column("details", width=280, minwidth=220, anchor="w")
         self.results_table.grid(row=1, column=0, sticky="nsew")
         self.results_table.tag_configure("ok", background="#edf7f2", foreground="#1d5d43")
         self.results_table.tag_configure("failed", background="#fbefef", foreground="#8a2f2f")
