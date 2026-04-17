@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     import pythoncom  # type: ignore[import]
@@ -399,6 +399,29 @@ class WordToPdfApp:
             darkcolor=self.colors["primary"],
             thickness=10,
         )
+        style.configure(
+            "Results.Treeview",
+            background="#f7f9fb",
+            fieldbackground="#f7f9fb",
+            foreground=self.colors["text"],
+            bordercolor=self.colors["border"],
+            rowheight=28,
+            relief="flat",
+        )
+        style.map(
+            "Results.Treeview",
+            background=[("selected", "#dbe7f3")],
+            foreground=[("selected", self.colors["text"])],
+        )
+        style.configure(
+            "Results.Treeview.Heading",
+            background="#eef2f6",
+            foreground=self.colors["text"],
+            bordercolor=self.colors["border"],
+            relief="flat",
+            font=("Segoe UI Semibold", 9),
+            padding=(8, 8),
+        )
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=28, style="App.TFrame")
@@ -601,23 +624,39 @@ class WordToPdfApp:
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
-        log_frame = ttk.LabelFrame(right_column, text="Activity Log", padding=20, style="Card.TLabelframe")
+        log_frame = ttk.LabelFrame(right_column, text="Results", padding=20, style="Card.TLabelframe")
         log_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
-        self.log_text = scrolledtext.ScrolledText(
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        columns = ("status", "source", "output", "details")
+        self.results_table = ttk.Treeview(
             log_frame,
-            height=22,
-            wrap="word",
-            font=("Consolas", 10),
-            state="disabled",
-            bd=0,
-            relief="flat",
-            bg="#f7f9fb",
-            fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            padx=12,
-            pady=12,
+            columns=columns,
+            show="headings",
+            style="Results.Treeview",
         )
-        self.log_text.pack(fill="both", expand=True)
+        self.results_table.heading("status", text="Status")
+        self.results_table.heading("source", text="Source")
+        self.results_table.heading("output", text="Output")
+        self.results_table.heading("details", text="Details")
+        self.results_table.column("status", width=90, minwidth=80, anchor="center")
+        self.results_table.column("source", width=210, minwidth=160, anchor="w")
+        self.results_table.column("output", width=210, minwidth=160, anchor="w")
+        self.results_table.column("details", width=260, minwidth=220, anchor="w")
+        self.results_table.grid(row=0, column=0, sticky="nsew")
+
+        table_scroll_y = ttk.Scrollbar(
+            log_frame, orient="vertical", command=self.results_table.yview
+        )
+        table_scroll_y.grid(row=0, column=1, sticky="ns")
+        self.results_table.configure(yscrollcommand=table_scroll_y.set)
+
+        table_scroll_x = ttk.Scrollbar(
+            log_frame, orient="horizontal", command=self.results_table.xview
+        )
+        table_scroll_x.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.results_table.configure(xscrollcommand=table_scroll_x.set)
 
     def _toggle_mode(self) -> None:
         directory_mode = self.mode_var.get() == "directory"
@@ -653,16 +692,23 @@ class WordToPdfApp:
         if selected:
             self.output_var.set(selected)
 
-    def _append_log(self, message: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    def _append_result(
+        self,
+        status: str,
+        source: str,
+        output: str,
+        details: str,
+    ) -> None:
+        item_id = self.results_table.insert(
+            "",
+            "end",
+            values=(status, source, output, details),
+        )
+        self.results_table.see(item_id)
 
     def _clear_log(self) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        for item in self.results_table.get_children():
+            self.results_table.delete(item)
 
     def _set_running_state(self, running: bool) -> None:
         if running:
@@ -686,7 +732,7 @@ class WordToPdfApp:
 
         self.progress_var.set(0)
         self.status_var.set("Starting conversion...")
-        self._append_log("Starting conversion task...")
+        self._append_result("INFO", "-", "-", "Starting conversion task.")
         self._set_running_state(True)
 
         self.worker_thread = threading.Thread(
@@ -705,7 +751,7 @@ class WordToPdfApp:
                 result = convert_word_to_pdf(
                     source, target, overwrite=self.overwrite_var.get()
                 )
-                self.event_queue.put(("file_success", result))
+                self.event_queue.put(("file_success", (source, result)))
                 return
 
             input_dir = resolve_input_path(input_text)
@@ -733,32 +779,38 @@ class WordToPdfApp:
             while True:
                 event_type, payload = self.event_queue.get_nowait()
                 if event_type == "file_success":
-                    result = payload
+                    source, result = payload
                     self.progress_var.set(100)
                     self.status_var.set("Single-file conversion completed.")
-                    self._append_log(f"Converted successfully: {result}")
+                    self._append_result(
+                        "OK",
+                        str(source),
+                        str(result),
+                        "Single-file conversion completed.",
+                    )
                     self._set_running_state(False)
                 elif event_type == "batch_progress":
                     index, total, result = payload
                     percentage = (index / total) * 100
-                    self.progress_var.set(percentage)
                     status = "OK" if result.success else "FAILED"
                     self.status_var.set(f"Processing {index}/{total}...")
-                    self._append_log(
-                        f"[{status}] {result.source} -> {result.target}"
+                    self.progress_var.set(percentage)
+                    self._append_result(
+                        status,
+                        str(result.source),
+                        str(result.target),
+                        result.message,
                     )
-                    if not result.success:
-                        self._append_log(f"        {result.message}")
                 elif event_type == "batch_complete":
                     results = payload
                     self.progress_var.set(100)
                     summary = format_batch_summary(results)
                     self.status_var.set(summary)
-                    self._append_log(summary)
+                    self._append_result("INFO", "-", "-", summary)
                     self._set_running_state(False)
                 elif event_type == "error":
                     self.status_var.set("Conversion failed.")
-                    self._append_log(f"Error: {payload}")
+                    self._append_result("ERROR", "-", "-", str(payload))
                     messagebox.showerror("Conversion Error", str(payload))
                     self._set_running_state(False)
         except queue.Empty:
