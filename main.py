@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import os
 import queue
+import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +28,13 @@ except ImportError:  # pragma: no cover - handled at runtime for missing depende
 WORD_SUFFIXES = {".doc", ".docx"}
 WD_EXPORT_FORMAT_PDF = 17
 WD_DO_NOT_SAVE_CHANGES = 0
+WORD_EXIT_TIMEOUT_SECONDS = 5.0
+
+
+class WordConversionError(RuntimeError):
+    def __init__(self, message: str, *, source: Path | None = None) -> None:
+        self.source = source
+        super().__init__(message)
 
 
 @dataclass(slots=True)
@@ -33,6 +43,12 @@ class BatchResult:
     target: Path
     success: bool
     message: str
+
+
+@dataclass(slots=True)
+class ConversionOutcome:
+    target: Path
+    warning: str | None = None
 
 
 def is_word_file(path: Path) -> bool:
@@ -77,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def ensure_dependencies() -> None:
     if pythoncom is None or win32com is None:
-        raise RuntimeError(
+        raise WordConversionError(
             "Missing dependency: pywin32. Install it with `pip install -r requirements.txt`."
         )
 
@@ -123,7 +139,80 @@ def build_batch_target(source: Path, input_root: Path, output_root: Path | None)
     return (output_root / relative_path).with_suffix(".pdf")
 
 
-def convert_word_to_pdf(source: Path, target: Path, overwrite: bool = False) -> Path:
+def _format_com_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    if text:
+        return text.replace("\r", " ").replace("\n", " ")
+    return exc.__class__.__name__
+
+
+def _get_word_process_id(word_app: object) -> int | None:
+    try:
+        hwnd = int(word_app.Hwnd)
+    except Exception:
+        return None
+
+    process_id = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    return int(process_id.value) or None
+
+
+def _wait_for_process_exit(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _force_terminate_process(pid: int) -> None:
+    subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _close_document(document: object | None) -> str | None:
+    if document is None:
+        return None
+
+    try:
+        document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+    except Exception as exc:
+        return f"Document close warning: {_format_com_error(exc)}"
+    return None
+
+
+def _quit_word_application(word_app: object | None, pid: int | None) -> str | None:
+    if word_app is None:
+        return None
+
+    quit_error: str | None = None
+    try:
+        word_app.Quit(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+    except Exception as exc:
+        quit_error = f"Word quit warning: {_format_com_error(exc)}"
+
+    if pid is not None and not _wait_for_process_exit(pid, WORD_EXIT_TIMEOUT_SECONDS):
+        _force_terminate_process(pid)
+        if not _wait_for_process_exit(pid, 2.0):
+            suffix = f"Word process {pid} is still running after forced termination."
+            quit_error = f"{quit_error} {suffix}".strip() if quit_error else suffix
+        else:
+            suffix = f"Word process {pid} did not exit cleanly and was terminated."
+            quit_error = f"{quit_error} {suffix}".strip() if quit_error else suffix
+
+    return quit_error
+
+
+def convert_word_to_pdf(
+    source: Path, target: Path, overwrite: bool = False
+) -> ConversionOutcome:
     ensure_dependencies()
 
     if target.exists() and not overwrite:
@@ -131,14 +220,24 @@ def convert_word_to_pdf(source: Path, target: Path, overwrite: bool = False) -> 
             f"Target file already exists: {target}. Use --overwrite to replace it."
         )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WordConversionError(
+            f"Unable to create output directory: {target.parent} ({exc})",
+            source=source,
+        ) from exc
+
     word = None
     document = None
+    word_pid = None
+    cleanup_warnings: list[str] = []
     pythoncom.CoInitialize()
     try:
         word = win32com.client.DispatchEx("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
+        word_pid = _get_word_process_id(word)
 
         document = word.Documents.Open(
             str(source),
@@ -162,27 +261,46 @@ def convert_word_to_pdf(source: Path, target: Path, overwrite: bool = False) -> 
             UseISO19005_1=False,
         )
     except com_error as exc:
-        raise RuntimeError(
-            "Word export failed. Make sure Microsoft Word is installed and the document can be opened normally."
+        details = _format_com_error(exc)
+        raise WordConversionError(
+            "Word export failed. Make sure Microsoft Word is installed and the document can be opened normally. "
+            f"Details: {details}",
+            source=source,
+        ) from exc
+    except Exception as exc:
+        raise WordConversionError(
+            f"Unexpected conversion failure for {source.name}: {exc}",
+            source=source,
         ) from exc
     finally:
-        if document is not None:
-            try:
-                document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
-            finally:
-                document = None
-        if word is not None:
-            try:
-                word.Quit()
-            finally:
-                word = None
+        close_warning = _close_document(document)
+        if close_warning:
+            cleanup_warnings.append(close_warning)
+        document = None
+
+        quit_warning = _quit_word_application(word, word_pid)
+        if quit_warning:
+            cleanup_warnings.append(quit_warning)
+        word = None
+
         gc.collect()
         pythoncom.CoUninitialize()
 
     if not target.exists():
-        raise RuntimeError(f"Export did not create the PDF file: {target}")
+        details = " ".join(cleanup_warnings).strip()
+        message = f"Export did not create the PDF file: {target}"
+        if details:
+            message = f"{message} Cleanup notes: {details}"
+        raise WordConversionError(message, source=source)
 
-    return target
+    warning = None
+    if cleanup_warnings:
+        warning = (
+            "Converted successfully, but Word cleanup reported warnings. "
+            f"{' '.join(cleanup_warnings)}"
+        )
+
+    return ConversionOutcome(target=target, warning=warning)
 
 
 def convert_directory_to_pdf(
@@ -205,12 +323,12 @@ def convert_directory_to_pdf(
     for index, source in enumerate(files, start=1):
         target = build_batch_target(source, input_dir, output_dir)
         try:
-            convert_word_to_pdf(source, target, overwrite=overwrite)
+            outcome = convert_word_to_pdf(source, target, overwrite=overwrite)
             result = BatchResult(
                 source=source,
                 target=target,
                 success=True,
-                message="Converted successfully.",
+                message=outcome.warning or "Converted successfully.",
             )
         except Exception as exc:
             result = BatchResult(
@@ -241,8 +359,10 @@ def run_cli(args: argparse.Namespace) -> int:
 
     if source.is_file():
         file_source, target = resolve_file_paths(args.input_path, args.output_path)
-        result = convert_word_to_pdf(file_source, target, overwrite=args.overwrite)
-        print(f"Converted successfully: {result}")
+        outcome = convert_word_to_pdf(file_source, target, overwrite=args.overwrite)
+        print(f"Converted successfully: {outcome.target}")
+        if outcome.warning:
+            print(f"Warning: {outcome.warning}", file=sys.stderr)
         return 0
 
     if source.is_dir():
@@ -1061,10 +1181,10 @@ class WordToPdfApp:
                 source, target = resolve_file_paths(
                     input_text, output_text or None
                 )
-                result = convert_word_to_pdf(
+                outcome = convert_word_to_pdf(
                     source, target, overwrite=self.overwrite_var.get()
                 )
-                self.event_queue.put(("file_success", (source, result)))
+                self.event_queue.put(("file_success", (source, outcome)))
                 return
 
             input_dir = resolve_input_path(input_text)
@@ -1092,14 +1212,14 @@ class WordToPdfApp:
             while True:
                 event_type, payload = self.event_queue.get_nowait()
                 if event_type == "file_success":
-                    source, result = payload
+                    source, outcome = payload
                     self.progress_var.set(100)
                     self.status_var.set("Single-file conversion completed.")
                     self._append_result(
                         "OK",
                         str(source),
-                        str(result),
-                        "Single-file conversion completed.",
+                        str(outcome.target),
+                        outcome.warning or "Single-file conversion completed.",
                     )
                     self._set_running_state(False)
                 elif event_type == "batch_progress":
