@@ -1,1 +1,2 @@
 pywin32>=306
+tkinterdnd2>=0.4.2

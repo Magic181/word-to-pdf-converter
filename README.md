@@ -8,6 +8,7 @@ This project uses `pywin32` to automate a locally installed Microsoft Word insta
 
 - Convert `.doc` and `.docx` files to PDF
 - Launch a desktop GUI for easier everyday use
+- Support drag and drop for input files, input folders, and output targets in the GUI
 - Batch-convert all Word files in a directory
 - Optionally scan subdirectories recursively
 - Use the source filename by default and export beside the original document

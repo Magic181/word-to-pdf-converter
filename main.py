@@ -16,6 +16,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore[import]
+except ImportError:  # pragma: no cover - optional dependency
+    DND_FILES = None
+    TkinterDnD = None
+
+try:
     import pythoncom  # type: ignore[import]
     import win32com.client  # type: ignore[import]
     from pywintypes import com_error  # type: ignore[import]
@@ -519,7 +525,7 @@ def run_cli(args: argparse.Namespace) -> int:
 
 class WordToPdfApp:
     def __init__(self) -> None:
-        self.root = tk.Tk()
+        self.root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
         self.root.title("Word to PDF Converter")
         self.root.geometry("1220x820")
         self.root.minsize(1080, 740)
@@ -545,6 +551,7 @@ class WordToPdfApp:
         self._apply_styles()
         self._build_ui()
         self._build_context_menu()
+        self._register_drop_targets()
         self._toggle_mode()
         self.root.after(150, self._poll_events)
 
@@ -754,6 +761,24 @@ class WordToPdfApp:
         tk.Label(
             meta_row,
             text="Single-file and batch conversion",
+            font=("Segoe UI", 9),
+            fg=self.colors["muted"],
+            bg=self.colors["hero"],
+        ).pack(side="left")
+        tk.Label(
+            meta_row,
+            text="  |  ",
+            font=("Segoe UI", 9),
+            fg=self.colors["hero_accent"],
+            bg=self.colors["hero"],
+        ).pack(side="left")
+        tk.Label(
+            meta_row,
+            text=(
+                "Drag files or folders into the window"
+                if TkinterDnD is not None
+                else "Install tkinterdnd2 to enable drag and drop"
+            ),
             font=("Segoe UI", 9),
             fg=self.colors["muted"],
             bg=self.colors["hero"],
@@ -1014,6 +1039,71 @@ class WordToPdfApp:
             label="Copy Details",
             command=lambda: self._copy_selected_path("details"),
         )
+
+    def _register_drop_targets(self) -> None:
+        if DND_FILES is None:
+            return
+
+        targets = [
+            (self.root, self._handle_input_drop),
+            (self.input_entry, self._handle_input_drop),
+            (self.output_entry, self._handle_output_drop),
+        ]
+        for widget, handler in targets:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", handler)
+
+    def _parse_drop_paths(self, data: str) -> list[Path]:
+        raw_items = self.root.tk.splitlist(data)
+        return [Path(item).expanduser().resolve() for item in raw_items]
+
+    def _handle_input_drop(self, event: object) -> str:
+        data = getattr(event, "data", "")
+        paths = self._parse_drop_paths(data)
+        if not paths:
+            self.status_var.set("No valid item was dropped.")
+            return "break"
+
+        path = paths[0]
+        if path.is_dir():
+            self.mode_var.set("directory")
+            self.input_var.set(str(path))
+            self._toggle_mode()
+            self.status_var.set(f"Input directory selected by drag and drop: {path}")
+            return "break"
+
+        if is_word_file(path):
+            self.mode_var.set("file")
+            self.input_var.set(str(path))
+            self._toggle_mode()
+            if not self.output_var.get().strip():
+                self.output_var.set(str(path.with_suffix(".pdf")))
+            self.status_var.set(f"Input file selected by drag and drop: {path.name}")
+            return "break"
+
+        self.status_var.set("Only Word files or directories can be dropped as input.")
+        return "break"
+
+    def _handle_output_drop(self, event: object) -> str:
+        data = getattr(event, "data", "")
+        paths = self._parse_drop_paths(data)
+        if not paths:
+            self.status_var.set("No valid item was dropped.")
+            return "break"
+
+        path = paths[0]
+        if path.is_dir():
+            self.output_var.set(str(path))
+            self.status_var.set(f"Output directory selected by drag and drop: {path}")
+            return "break"
+
+        if path.suffix.lower() == ".pdf":
+            self.output_var.set(str(path))
+            self.status_var.set(f"Output PDF selected by drag and drop: {path.name}")
+            return "break"
+
+        self.status_var.set("Drop a PDF file or a directory into the output field.")
+        return "break"
 
     def _toggle_mode(self) -> None:
         directory_mode = self.mode_var.get() == "directory"

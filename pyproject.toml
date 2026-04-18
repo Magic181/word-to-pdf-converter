@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pywin32>=306",
+    "tkinterdnd2>=0.4.2",
 ]
 
 [project.scripts]
