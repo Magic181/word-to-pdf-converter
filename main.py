@@ -155,6 +155,12 @@ def build_batch_target(source: Path, input_root: Path, output_root: Path | None)
     return (output_root / relative_path).with_suffix(".pdf")
 
 
+def build_list_target(source: Path, output_root: Path | None) -> Path:
+    if output_root is None:
+        return source.with_suffix(".pdf")
+    return (output_root / source.with_suffix(".pdf").name).resolve()
+
+
 def _format_com_error(exc: Exception) -> str:
     text = str(exc).strip()
     if text:
@@ -470,6 +476,102 @@ def convert_directory_to_pdf(
     )
 
 
+def convert_file_list_to_pdf(
+    sources: list[Path],
+    output_dir: Path | None = None,
+    *,
+    overwrite: bool = False,
+    progress_callback: Callable[[int, int, BatchResult], None] | None = None,
+) -> BatchConversionOutcome:
+    if not sources:
+        raise FileNotFoundError("No Word files were provided for batch conversion.")
+
+    files = [path.resolve() for path in sources if is_word_file(path.resolve())]
+    if not files:
+        raise FileNotFoundError("No valid Word files were provided for batch conversion.")
+
+    results: list[BatchResult] = []
+    cleanup_warnings: list[str] = []
+    session_restarts = 0
+    consecutive_failures = 0
+    total = len(files)
+    start_time = time.perf_counter()
+
+    session = WordAutomationSession().__enter__()
+    try:
+        for index, source in enumerate(files, start=1):
+            target = build_list_target(source, output_dir)
+            try:
+                outcome = session.convert_file(source, target, overwrite=overwrite)
+                result = BatchResult(
+                    source=source,
+                    target=target,
+                    success=True,
+                    message=outcome.warning or "Converted successfully.",
+                )
+                consecutive_failures = 0
+            except Exception as exc:
+                result = BatchResult(
+                    source=source,
+                    target=target,
+                    success=False,
+                    message=str(exc),
+                )
+                consecutive_failures += 1
+
+            results.append(result)
+            if progress_callback is not None:
+                progress_callback(index, total, result)
+
+            if consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD and index < total:
+                previous_pid = session.word_pid
+                session.__exit__(None, None, None)
+                if session.cleanup_warnings:
+                    cleanup_warnings.extend(session.cleanup_warnings)
+                session_restarts += 1
+                consecutive_failures = 0
+
+                try:
+                    session = WordAutomationSession().__enter__()
+                    restart_message = (
+                        "Word session restarted after consecutive failures to isolate subsequent files."
+                    )
+                    if previous_pid is not None:
+                        restart_message = f"{restart_message} Previous PID: {previous_pid}."
+                    info_result = BatchResult(
+                        source=source,
+                        target=target,
+                        success=True,
+                        message=restart_message,
+                    )
+                    if progress_callback is not None:
+                        progress_callback(index, total, info_result)
+                except Exception as restart_exc:
+                    raise WordConversionError(
+                        f"Unable to restart Word after consecutive failures: {restart_exc}"
+                    ) from restart_exc
+    finally:
+        session.__exit__(None, None, None)
+        if session.cleanup_warnings:
+            cleanup_warnings.extend(session.cleanup_warnings)
+
+    cleanup_warning = None
+    if cleanup_warnings:
+        cleanup_warning = (
+            "Batch finished, but Word cleanup reported warnings. "
+            f"{' '.join(cleanup_warnings)}"
+        )
+
+    duration_seconds = time.perf_counter() - start_time
+    return BatchConversionOutcome(
+        results=results,
+        warning=cleanup_warning,
+        duration_seconds=duration_seconds,
+        reused_single_session=(session_restarts == 0),
+        session_restarts=session_restarts,
+    )
+
+
 def format_batch_summary(results: list[BatchResult]) -> str:
     success_count = sum(1 for result in results if result.success)
     failed_count = len(results) - success_count
@@ -537,6 +639,14 @@ class WordToPdfApp:
         self.recursive_var = tk.BooleanVar(value=False)
         self.overwrite_var = tk.BooleanVar(value=False)
         self.failures_only_var = tk.BooleanVar(value=False)
+        self.drop_hint_var = tk.StringVar(
+            value=(
+                "Drag a Word file or folder onto the window. "
+                "You can also drop multiple Word files for a one-off batch."
+                if TkinterDnD is not None
+                else "Install tkinterdnd2 to enable drag and drop."
+            )
+        )
         self.status_var = tk.StringVar(
             value="Ready. Select a Word file or a directory to begin."
         )
@@ -547,6 +657,7 @@ class WordToPdfApp:
         self.result_rows: list[dict[str, str]] = []
         self.sort_column = "status"
         self.sort_descending = False
+        self.dropped_files: list[Path] = []
 
         self._apply_styles()
         self._build_ui()
@@ -783,6 +894,21 @@ class WordToPdfApp:
             fg=self.colors["muted"],
             bg=self.colors["hero"],
         ).pack(side="left")
+
+        drop_hint = tk.Label(
+            hero,
+            textvariable=self.drop_hint_var,
+            font=("Segoe UI", 10),
+            fg=self.colors["text"],
+            bg="#f6f8fb",
+            padx=14,
+            pady=10,
+            anchor="w",
+            justify="left",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
+        drop_hint.pack(fill="x", pady=(16, 0))
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
@@ -1057,6 +1183,26 @@ class WordToPdfApp:
         raw_items = self.root.tk.splitlist(data)
         return [Path(item).expanduser().resolve() for item in raw_items]
 
+    def _show_drop_error(self, message: str) -> str:
+        self.status_var.set(message)
+        messagebox.showerror("Unsupported Drop", message)
+        return "break"
+
+    def _set_batch_file_drop(self, files: list[Path]) -> None:
+        self.dropped_files = files
+        self.mode_var.set("directory")
+        self._toggle_mode()
+        first_parent = files[0].parent
+        self.input_var.set(f"{len(files)} dropped Word files")
+        if not self.output_var.get().strip():
+            self.output_var.set(str(first_parent))
+        self.drop_hint_var.set(
+            f"Using {len(files)} dropped Word files for a one-off batch conversion."
+        )
+        self.status_var.set(
+            f"Prepared a dropped-file batch with {len(files)} Word files."
+        )
+
     def _handle_input_drop(self, event: object) -> str:
         data = getattr(event, "data", "")
         paths = self._parse_drop_paths(data)
@@ -1064,25 +1210,55 @@ class WordToPdfApp:
             self.status_var.set("No valid item was dropped.")
             return "break"
 
-        path = paths[0]
-        if path.is_dir():
+        if len(paths) == 1 and paths[0].is_dir():
+            path = paths[0]
+            self.dropped_files = []
             self.mode_var.set("directory")
             self.input_var.set(str(path))
             self._toggle_mode()
+            self.drop_hint_var.set(
+                "Directory batch mode is ready. Drag a folder here anytime to replace it."
+            )
             self.status_var.set(f"Input directory selected by drag and drop: {path}")
             return "break"
 
-        if is_word_file(path):
+        word_files = [path for path in paths if is_word_file(path)]
+        invalid_paths = [path for path in paths if not is_word_file(path) and not path.is_dir()]
+        dropped_directories = [path for path in paths if path.is_dir()]
+
+        if invalid_paths:
+            names = ", ".join(path.name for path in invalid_paths[:3])
+            suffix = " ..." if len(invalid_paths) > 3 else ""
+            return self._show_drop_error(
+                f"Only Word files or folders can be dropped as input. Unsupported item(s): {names}{suffix}"
+            )
+
+        if dropped_directories and len(paths) > 1:
+            return self._show_drop_error(
+                "Please drop either one folder or one/multiple Word files, not a mixed selection."
+            )
+
+        if len(word_files) > 1:
+            self._set_batch_file_drop(word_files)
+            return "break"
+
+        if len(word_files) == 1:
+            path = word_files[0]
+            self.dropped_files = []
             self.mode_var.set("file")
             self.input_var.set(str(path))
             self._toggle_mode()
             if not self.output_var.get().strip():
                 self.output_var.set(str(path.with_suffix(".pdf")))
+            self.drop_hint_var.set(
+                "Single-file mode is ready. Drag another Word file here to replace it."
+            )
             self.status_var.set(f"Input file selected by drag and drop: {path.name}")
             return "break"
 
-        self.status_var.set("Only Word files or directories can be dropped as input.")
-        return "break"
+        return self._show_drop_error(
+            "Only Word files or directories can be dropped as input."
+        )
 
     def _handle_output_drop(self, event: object) -> str:
         data = getattr(event, "data", "")
@@ -1102,8 +1278,9 @@ class WordToPdfApp:
             self.status_var.set(f"Output PDF selected by drag and drop: {path.name}")
             return "break"
 
-        self.status_var.set("Drop a PDF file or a directory into the output field.")
-        return "break"
+        return self._show_drop_error(
+            "Drop a PDF file or a directory into the output field."
+        )
 
     def _toggle_mode(self) -> None:
         directory_mode = self.mode_var.get() == "directory"
@@ -1379,7 +1556,7 @@ class WordToPdfApp:
         output_text = self.output_var.get().strip()
         mode = self.mode_var.get()
 
-        if not input_text:
+        if not input_text and not self.dropped_files:
             messagebox.showerror("Missing Input", "Please select an input file or directory.")
             return
 
@@ -1405,6 +1582,21 @@ class WordToPdfApp:
                     source, target, overwrite=self.overwrite_var.get()
                 )
                 self.event_queue.put(("file_success", (source, outcome)))
+                return
+
+            if self.dropped_files:
+                output_dir = Path(output_text).expanduser().resolve() if output_text else None
+
+                def on_progress(index: int, total: int, result: BatchResult) -> None:
+                    self.event_queue.put(("batch_progress", (index, total, result)))
+
+                batch_outcome = convert_file_list_to_pdf(
+                    self.dropped_files,
+                    output_dir,
+                    overwrite=self.overwrite_var.get(),
+                    progress_callback=on_progress,
+                )
+                self.event_queue.put(("batch_complete", batch_outcome))
                 return
 
             input_dir = resolve_input_path(input_text)
