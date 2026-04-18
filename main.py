@@ -29,6 +29,7 @@ WORD_SUFFIXES = {".doc", ".docx"}
 WD_EXPORT_FORMAT_PDF = 17
 WD_DO_NOT_SAVE_CHANGES = 0
 WORD_EXIT_TIMEOUT_SECONDS = 5.0
+BATCH_SESSION_RESTART_FAILURE_THRESHOLD = 2
 
 
 class WordConversionError(RuntimeError):
@@ -55,6 +56,9 @@ class ConversionOutcome:
 class BatchConversionOutcome:
     results: list[BatchResult]
     warning: str | None = None
+    duration_seconds: float = 0.0
+    reused_single_session: bool = True
+    session_restarts: int = 0
 
 
 def is_word_file(path: Path) -> bool:
@@ -181,6 +185,15 @@ def _force_terminate_process(pid: int) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{int(minutes)}m {remainder:.1f}s"
 
 
 def _close_document(document: object | None) -> str | None:
@@ -371,7 +384,13 @@ def convert_directory_to_pdf(
 
     results: list[BatchResult] = []
     total = len(files)
-    with WordAutomationSession() as session:
+    cleanup_warnings: list[str] = []
+    session_restarts = 0
+    consecutive_failures = 0
+    start_time = time.perf_counter()
+
+    session = WordAutomationSession().__enter__()
+    try:
         for index, source in enumerate(files, start=1):
             target = build_batch_target(source, input_dir, output_dir)
             try:
@@ -382,6 +401,7 @@ def convert_directory_to_pdf(
                     success=True,
                     message=outcome.warning or "Converted successfully.",
                 )
+                consecutive_failures = 0
             except Exception as exc:
                 result = BatchResult(
                     source=source,
@@ -389,19 +409,59 @@ def convert_directory_to_pdf(
                     success=False,
                     message=str(exc),
                 )
+                consecutive_failures += 1
 
             results.append(result)
             if progress_callback is not None:
                 progress_callback(index, total, result)
 
-        cleanup_warning = None
-        if session.cleanup_warnings:
-            cleanup_warning = (
-                "Batch finished, but Word cleanup reported warnings. "
-                f"{' '.join(session.cleanup_warnings)}"
-            )
+            if consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD and index < total:
+                previous_pid = session.word_pid
+                session.__exit__(None, None, None)
+                if session.cleanup_warnings:
+                    cleanup_warnings.extend(session.cleanup_warnings)
+                session_restarts += 1
+                consecutive_failures = 0
 
-    return BatchConversionOutcome(results=results, warning=cleanup_warning)
+                try:
+                    session = WordAutomationSession().__enter__()
+                    restart_message = (
+                        "Word session restarted after consecutive failures to isolate subsequent files."
+                    )
+                    if previous_pid is not None:
+                        restart_message = f"{restart_message} Previous PID: {previous_pid}."
+                    info_result = BatchResult(
+                        source=source,
+                        target=target,
+                        success=True,
+                        message=restart_message,
+                    )
+                    if progress_callback is not None:
+                        progress_callback(index, total, info_result)
+                except Exception as restart_exc:
+                    raise WordConversionError(
+                        f"Unable to restart Word after consecutive failures: {restart_exc}"
+                    ) from restart_exc
+    finally:
+        session.__exit__(None, None, None)
+        if session.cleanup_warnings:
+            cleanup_warnings.extend(session.cleanup_warnings)
+
+    cleanup_warning = None
+    if cleanup_warnings:
+        cleanup_warning = (
+            "Batch finished, but Word cleanup reported warnings. "
+            f"{' '.join(cleanup_warnings)}"
+        )
+
+    duration_seconds = time.perf_counter() - start_time
+    return BatchConversionOutcome(
+        results=results,
+        warning=cleanup_warning,
+        duration_seconds=duration_seconds,
+        reused_single_session=(session_restarts == 0),
+        session_restarts=session_restarts,
+    )
 
 
 def format_batch_summary(results: list[BatchResult]) -> str:
@@ -443,6 +503,13 @@ def run_cli(args: argparse.Namespace) -> int:
                 print(f"        {result.message}")
 
         print(format_batch_summary(batch_outcome.results))
+        session_note = (
+            "Batch used a single reusable Word session."
+            if batch_outcome.reused_single_session
+            else f"Batch reused Word sessions with {batch_outcome.session_restarts} automatic restart(s)."
+        )
+        print(f"Info: {session_note}")
+        print(f"Info: Batch duration: {_format_duration(batch_outcome.duration_seconds)}")
         if batch_outcome.warning:
             print(f"Warning: {batch_outcome.warning}", file=sys.stderr)
         return 0 if all(result.success for result in batch_outcome.results) else 1
@@ -1303,6 +1370,21 @@ class WordToPdfApp:
                     summary = format_batch_summary(batch_outcome.results)
                     self.status_var.set(summary)
                     self._append_result("INFO", "-", "-", summary)
+                    session_note = (
+                        "This batch reused a single Word session."
+                        if batch_outcome.reused_single_session
+                        else (
+                            "This batch automatically restarted the Word session "
+                            f"{batch_outcome.session_restarts} time(s) after consecutive failures."
+                        )
+                    )
+                    self._append_result("INFO", "-", "-", session_note)
+                    self._append_result(
+                        "INFO",
+                        "-",
+                        "-",
+                        f"Batch duration: {_format_duration(batch_outcome.duration_seconds)}",
+                    )
                     if batch_outcome.warning:
                         self._append_result("INFO", "-", "-", batch_outcome.warning)
                     self._set_running_state(False)
