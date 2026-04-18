@@ -658,6 +658,9 @@ class WordToPdfApp:
         self.sort_column = "status"
         self.sort_descending = False
         self.dropped_files: list[Path] = []
+        self.drop_hint_default_bg = "#f6f8fb"
+        self.drop_hint_active_bg = "#e7f0fb"
+        self.drop_hint_default_border = self.colors["border"] if hasattr(self, "colors") else "#d8dee6"
 
         self._apply_styles()
         self._build_ui()
@@ -693,6 +696,7 @@ class WordToPdfApp:
             "primary_active": "#1d3a59",
             "secondary": "#eef2f6",
             "secondary_active": "#e2e8ef",
+            "drop_active_border": "#6f8fb3",
         }
 
         style.configure(".", font=("Segoe UI", 10))
@@ -895,12 +899,12 @@ class WordToPdfApp:
             bg=self.colors["hero"],
         ).pack(side="left")
 
-        drop_hint = tk.Label(
+        self.drop_hint_label = tk.Label(
             hero,
             textvariable=self.drop_hint_var,
             font=("Segoe UI", 10),
             fg=self.colors["text"],
-            bg="#f6f8fb",
+            bg=self.drop_hint_default_bg,
             padx=14,
             pady=10,
             anchor="w",
@@ -908,7 +912,8 @@ class WordToPdfApp:
             highlightthickness=1,
             highlightbackground=self.colors["border"],
         )
-        drop_hint.pack(fill="x", pady=(16, 0))
+        self.drop_hint_label.pack(fill="x", pady=(16, 0))
+        self.drop_hint_default_border = self.colors["border"]
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
@@ -991,6 +996,90 @@ class WordToPdfApp:
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
+        self.pending_frame = ttk.LabelFrame(
+            self.left_column,
+            text="Dropped Files",
+            padding=20,
+            style="Card.TLabelframe",
+        )
+        self.pending_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self.pending_frame,
+            text="Files dropped for one-off batch conversion",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+
+        list_frame = ttk.Frame(self.pending_frame, style="Card.TFrame")
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self.pending_listbox = tk.Listbox(
+            list_frame,
+            height=6,
+            activestyle="none",
+            font=("Segoe UI", 9),
+            bg="#f7f9fb",
+            fg=self.colors["text"],
+            selectbackground="#dbe7f3",
+            selectforeground=self.colors["text"],
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            relief="flat",
+        )
+        self.pending_listbox.grid(row=0, column=0, sticky="nsew")
+
+        pending_scroll = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.pending_listbox.yview
+        )
+        pending_scroll.grid(row=0, column=1, sticky="ns")
+        self.pending_listbox.configure(yscrollcommand=pending_scroll.set)
+
+        pending_actions = ttk.Frame(self.pending_frame, style="Card.TFrame")
+        pending_actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        pending_actions.columnconfigure(0, weight=1)
+        pending_actions.columnconfigure(1, weight=1)
+
+        self.remove_pending_button = tk.Button(
+            pending_actions,
+            text="Remove Selected",
+            command=self._remove_selected_dropped_files,
+            font=("Segoe UI", 9),
+            fg=self.colors["text"],
+            bg=self.colors["secondary"],
+            activeforeground=self.colors["text"],
+            activebackground=self.colors["secondary_active"],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=9,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
+        self.remove_pending_button.grid(row=0, column=0, sticky="ew")
+
+        self.clear_pending_button = tk.Button(
+            pending_actions,
+            text="Clear All",
+            command=self._clear_dropped_files,
+            font=("Segoe UI", 9),
+            fg=self.colors["text"],
+            bg=self.colors["secondary"],
+            activeforeground=self.colors["text"],
+            activebackground=self.colors["secondary_active"],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=9,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
+        self.clear_pending_button.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+
         options_frame = ttk.LabelFrame(self.left_column, text="Options", padding=20, style="Card.TLabelframe")
         options_frame.pack(fill="x", pady=(16, 0))
         options_frame.columnconfigure(0, weight=1)
@@ -1050,6 +1139,7 @@ class WordToPdfApp:
             highlightbackground=self.colors["border"],
         )
         self.clear_button.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        self._refresh_pending_file_list()
 
         progress_frame = ttk.LabelFrame(self.right_column, text="Progress", padding=20, style="Card.TLabelframe")
         progress_frame.grid(row=0, column=0, sticky="ew")
@@ -1178,30 +1268,114 @@ class WordToPdfApp:
         for widget, handler in targets:
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind("<<Drop>>", handler)
+            widget.dnd_bind("<<DropEnter>>", self._handle_drop_enter)
+            widget.dnd_bind("<<DropLeave>>", self._handle_drop_leave)
+
+    def _handle_drop_enter(self, event: object) -> str:
+        self.drop_hint_label.configure(
+            bg=self.drop_hint_active_bg,
+            highlightbackground=self.colors["drop_active_border"],
+        )
+        self.status_var.set("Drop here to use the selected file or folder.")
+        return "break"
+
+    def _handle_drop_leave(self, event: object) -> str:
+        self.drop_hint_label.configure(
+            bg=self.drop_hint_default_bg,
+            highlightbackground=self.drop_hint_default_border,
+        )
+        return "break"
 
     def _parse_drop_paths(self, data: str) -> list[Path]:
         raw_items = self.root.tk.splitlist(data)
         return [Path(item).expanduser().resolve() for item in raw_items]
 
     def _show_drop_error(self, message: str) -> str:
+        self._handle_drop_leave(None)
         self.status_var.set(message)
         messagebox.showerror("Unsupported Drop", message)
         return "break"
+
+    def _clear_dropped_files(self) -> None:
+        self.dropped_files = []
+        self._refresh_pending_file_list()
+        self.drop_hint_var.set(
+            "Drag a Word file or folder onto the window. "
+            "You can also drop multiple Word files for a one-off batch."
+            if TkinterDnD is not None
+            else "Install tkinterdnd2 to enable drag and drop."
+        )
+        if self.mode_var.get() == "directory" and not self.input_var.get().strip():
+            self.mode_var.set("file")
+            self._toggle_mode()
+
+    def _refresh_pending_file_list(self) -> None:
+        self.pending_listbox.delete(0, "end")
+        for path in self.dropped_files:
+            self.pending_listbox.insert("end", path.name)
+
+        if self.dropped_files:
+            if not self.pending_frame.winfo_manager():
+                self.pending_frame.pack(fill="x", pady=(16, 0))
+            self.input_var.set(f"{len(self.dropped_files)} dropped Word files")
+            self.drop_hint_var.set(
+                f"Using {len(self.dropped_files)} dropped Word files for a one-off batch conversion."
+            )
+        else:
+            if self.pending_frame.winfo_manager():
+                self.pending_frame.pack_forget()
+            if self.input_var.get().endswith("dropped Word files"):
+                self.input_var.set("")
+
+    def _remove_selected_dropped_files(self) -> None:
+        selected = list(self.pending_listbox.curselection())
+        if not selected:
+            self.status_var.set("Select one or more dropped files to remove.")
+            return
+
+        for index in reversed(selected):
+            del self.dropped_files[index]
+
+        if len(self.dropped_files) == 1:
+            remaining = self.dropped_files[0]
+            self.dropped_files = []
+            self.mode_var.set("file")
+            self.input_var.set(str(remaining))
+            if not self.output_var.get().strip():
+                self.output_var.set(str(remaining.with_suffix(".pdf")))
+            self.drop_hint_var.set(
+                "Single-file mode is ready. Drag another Word file here to replace it."
+            )
+            self.status_var.set(f"Kept one file and switched to single-file mode: {remaining.name}")
+            self._toggle_mode()
+            self._refresh_pending_file_list()
+            return
+
+        if not self.dropped_files:
+            self._clear_dropped_files()
+            self.status_var.set("Cleared the dropped-file batch list.")
+            return
+
+        self._refresh_pending_file_list()
+        self.status_var.set(
+            f"Removed selected files. {len(self.dropped_files)} dropped files remain."
+        )
 
     def _set_batch_file_drop(self, files: list[Path]) -> None:
         self.dropped_files = files
         self.mode_var.set("directory")
         self._toggle_mode()
         first_parent = files[0].parent
-        self.input_var.set(f"{len(files)} dropped Word files")
         if not self.output_var.get().strip():
             self.output_var.set(str(first_parent))
         self.drop_hint_var.set(
             f"Using {len(files)} dropped Word files for a one-off batch conversion."
         )
+        self._refresh_pending_file_list()
         self.status_var.set(
             f"Prepared a dropped-file batch with {len(files)} Word files."
         )
+        self._handle_drop_leave(None)
 
     def _handle_input_drop(self, event: object) -> str:
         data = getattr(event, "data", "")
@@ -1213,6 +1387,7 @@ class WordToPdfApp:
         if len(paths) == 1 and paths[0].is_dir():
             path = paths[0]
             self.dropped_files = []
+            self._refresh_pending_file_list()
             self.mode_var.set("directory")
             self.input_var.set(str(path))
             self._toggle_mode()
@@ -1220,6 +1395,7 @@ class WordToPdfApp:
                 "Directory batch mode is ready. Drag a folder here anytime to replace it."
             )
             self.status_var.set(f"Input directory selected by drag and drop: {path}")
+            self._handle_drop_leave(event)
             return "break"
 
         word_files = [path for path in paths if is_word_file(path)]
@@ -1245,6 +1421,7 @@ class WordToPdfApp:
         if len(word_files) == 1:
             path = word_files[0]
             self.dropped_files = []
+            self._refresh_pending_file_list()
             self.mode_var.set("file")
             self.input_var.set(str(path))
             self._toggle_mode()
@@ -1254,6 +1431,7 @@ class WordToPdfApp:
                 "Single-file mode is ready. Drag another Word file here to replace it."
             )
             self.status_var.set(f"Input file selected by drag and drop: {path.name}")
+            self._handle_drop_leave(event)
             return "break"
 
         return self._show_drop_error(
@@ -1271,11 +1449,13 @@ class WordToPdfApp:
         if path.is_dir():
             self.output_var.set(str(path))
             self.status_var.set(f"Output directory selected by drag and drop: {path}")
+            self._handle_drop_leave(event)
             return "break"
 
         if path.suffix.lower() == ".pdf":
             self.output_var.set(str(path))
             self.status_var.set(f"Output PDF selected by drag and drop: {path.name}")
+            self._handle_drop_leave(event)
             return "break"
 
         return self._show_drop_error(
@@ -1302,6 +1482,7 @@ class WordToPdfApp:
                 filetypes=[("Word documents", "*.doc *.docx"), ("All files", "*.*")],
             )
         if selected:
+            self._clear_dropped_files()
             self.input_var.set(selected)
 
     def _browse_output(self) -> None:
