@@ -33,9 +33,11 @@ except ImportError:  # pragma: no cover - handled at runtime for missing depende
 
 WORD_SUFFIXES = {".doc", ".docx"}
 EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb"}
-SUPPORTED_INPUT_SUFFIXES = WORD_SUFFIXES | EXCEL_SUFFIXES
+POWERPOINT_SUFFIXES = {".ppt", ".pptx", ".pptm"}
+SUPPORTED_INPUT_SUFFIXES = WORD_SUFFIXES | EXCEL_SUFFIXES | POWERPOINT_SUFFIXES
 WD_EXPORT_FORMAT_PDF = 17
 XL_TYPE_PDF = 0
+PP_SAVE_AS_PDF = 32
 WD_DO_NOT_SAVE_CHANGES = 0
 WORD_EXIT_TIMEOUT_SECONDS = 5.0
 BATCH_SESSION_RESTART_FAILURE_THRESHOLD = 2
@@ -88,6 +90,8 @@ def detect_input_kind(path: Path) -> str | None:
         return "word"
     if suffix in EXCEL_SUFFIXES:
         return "excel"
+    if suffix in POWERPOINT_SUFFIXES:
+        return "powerpoint"
     return None
 
 
@@ -96,7 +100,7 @@ def supported_input_patterns() -> str:
 
 
 def supported_input_label() -> str:
-    return ".doc/.docx/.xls/.xlsx/.xlsm/.xlsb"
+    return ".doc/.docx/.xls/.xlsx/.xlsm/.xlsb/.ppt/.pptx/.pptm"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -256,7 +260,10 @@ def _close_document(document: object | None) -> str | None:
         return None
 
     try:
-        document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+        try:
+            document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+        except TypeError:
+            document.Close()
     except Exception as exc:
         return f"Document close warning: {_format_com_error(exc)}"
     return None
@@ -270,7 +277,10 @@ def _quit_office_application(
 
     quit_error: str | None = None
     try:
-        app_object.Quit(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+        try:
+            app_object.Quit(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+        except TypeError:
+            app_object.Quit()
     except Exception as exc:
         quit_error = f"{app_name} quit warning: {_format_com_error(exc)}"
 
@@ -507,6 +517,109 @@ class ExcelAutomationSession:
         return ConversionOutcome(target=target, warning=warning)
 
 
+class PowerPointAutomationSession:
+    def __init__(self) -> None:
+        self.powerpoint = None
+        self.powerpoint_pid: int | None = None
+        self.cleanup_warnings: list[str] = []
+        self._initialized = False
+
+    def __enter__(self) -> PowerPointAutomationSession:
+        ensure_dependencies()
+        pythoncom.CoInitialize()
+        self._initialized = True
+        try:
+            self.powerpoint = win32com.client.DispatchEx("PowerPoint.Application")
+            self.powerpoint.Visible = True
+            self.powerpoint_pid = _get_word_process_id(self.powerpoint)
+        except Exception:
+            if self._initialized:
+                pythoncom.CoUninitialize()
+                self._initialized = False
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        quit_warning = _quit_office_application(
+            self.powerpoint, self.powerpoint_pid, "PowerPoint"
+        )
+        if quit_warning:
+            self.cleanup_warnings.append(quit_warning)
+        self.powerpoint = None
+        self.powerpoint_pid = None
+        gc.collect()
+        if self._initialized:
+            pythoncom.CoUninitialize()
+            self._initialized = False
+
+    def convert_file(
+        self, source: Path, target: Path, overwrite: bool = False
+    ) -> ConversionOutcome:
+        if target.exists() and not overwrite:
+            raise FileExistsError(
+                f"Target file already exists: {target}. Use --overwrite to replace it."
+            )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WordConversionError(
+                f"Unable to create output directory: {target.parent} ({exc})",
+                source=source,
+            ) from exc
+
+        presentation = None
+        local_warnings: list[str] = []
+        try:
+            if self.powerpoint is None:
+                raise WordConversionError(
+                    "PowerPoint automation session is not available.",
+                    source=source,
+                )
+
+            presentation = self.powerpoint.Presentations.Open(
+                str(source),
+                ReadOnly=True,
+                Untitled=False,
+                WithWindow=False,
+            )
+            presentation.SaveAs(str(target), PP_SAVE_AS_PDF)
+        except com_error as exc:
+            details = _format_com_error(exc)
+            raise WordConversionError(
+                "PowerPoint export failed. Make sure Microsoft PowerPoint is installed and the document can be opened normally. "
+                f"Details: {details}",
+                source=source,
+            ) from exc
+        except Exception as exc:
+            if isinstance(exc, WordConversionError):
+                raise
+            raise WordConversionError(
+                f"Unexpected conversion failure for {source.name}: {exc}",
+                source=source,
+            ) from exc
+        finally:
+            close_warning = _close_document(presentation)
+            if close_warning:
+                local_warnings.append(close_warning.replace("Document", "Presentation"))
+            presentation = None
+
+        if not target.exists():
+            details = " ".join(local_warnings).strip()
+            message = f"Export did not create the PDF file: {target}"
+            if details:
+                message = f"{message} Cleanup notes: {details}"
+            raise WordConversionError(message, source=source)
+
+        warning = None
+        if local_warnings:
+            warning = (
+                "Converted successfully, but presentation cleanup reported warnings. "
+                f"{' '.join(local_warnings)}"
+            )
+
+        return ConversionOutcome(target=target, warning=warning)
+
+
 def convert_word_to_pdf(
     source: Path, target: Path, overwrite: bool = False
 ) -> ConversionOutcome:
@@ -531,11 +644,25 @@ def convert_word_to_pdf(
                 return ConversionOutcome(target=outcome.target, warning=warning)
             return outcome
 
-    with ExcelAutomationSession() as session:
+    if kind == "excel":
+        with ExcelAutomationSession() as session:
+            outcome = session.convert_file(source, target, overwrite=overwrite)
+            if session.cleanup_warnings:
+                cleanup_warning = (
+                    "Converted successfully, but Excel cleanup reported warnings. "
+                    f"{' '.join(session.cleanup_warnings)}"
+                )
+                warning = " ".join(
+                    part for part in [outcome.warning, cleanup_warning] if part
+                )
+                return ConversionOutcome(target=outcome.target, warning=warning)
+            return outcome
+
+    with PowerPointAutomationSession() as session:
         outcome = session.convert_file(source, target, overwrite=overwrite)
         if session.cleanup_warnings:
             cleanup_warning = (
-                "Converted successfully, but Excel cleanup reported warnings. "
+                "Converted successfully, but PowerPoint cleanup reported warnings. "
                 f"{' '.join(session.cleanup_warnings)}"
             )
             warning = " ".join(
@@ -550,6 +677,8 @@ def _open_session_for_kind(kind: str):
         return WordAutomationSession().__enter__()
     if kind == "excel":
         return ExcelAutomationSession().__enter__()
+    if kind == "powerpoint":
+        return PowerPointAutomationSession().__enter__()
     raise WordConversionError(f"Unsupported session kind: {kind}")
 
 
@@ -558,6 +687,8 @@ def _extract_session_pid(session: object) -> int | None:
         return getattr(session, "word_pid")
     if hasattr(session, "excel_pid"):
         return getattr(session, "excel_pid")
+    if hasattr(session, "powerpoint_pid"):
+        return getattr(session, "powerpoint_pid")
     return None
 
 
@@ -892,7 +1023,7 @@ class WordToPdfApp:
         self.failures_only_var = tk.BooleanVar(value=False)
         self.drop_hint_var = tk.StringVar(
             value=(
-                "Drag a Word/Excel file or folder onto the window. "
+                "Drag a Word/Excel/PowerPoint file or folder onto the window. "
                 "You can also drop multiple supported files for a one-off batch."
                 if TkinterDnD is not None
                 else "Install tkinterdnd2 to enable drag and drop."
@@ -1257,7 +1388,10 @@ class WordToPdfApp:
 
         ttk.Label(
             self.pending_frame,
-            text="Files dropped for one-off batch conversion (.doc/.docx/.xls/.xlsx/.xlsm/.xlsb)",
+            text=(
+                "Files dropped for one-off batch conversion "
+                "(.doc/.docx/.xls/.xlsx/.xlsm/.xlsb/.ppt/.pptx/.pptm)"
+            ),
             style="Muted.TLabel",
         ).grid(row=0, column=0, sticky="w")
 
@@ -1551,7 +1685,7 @@ class WordToPdfApp:
         self.dropped_files = []
         self._refresh_pending_file_list()
         self.drop_hint_var.set(
-            "Drag a Word/Excel file or folder onto the window. "
+            "Drag a Word/Excel/PowerPoint file or folder onto the window. "
             "You can also drop multiple supported files for a one-off batch."
             if TkinterDnD is not None
             else "Install tkinterdnd2 to enable drag and drop."
@@ -1734,6 +1868,7 @@ class WordToPdfApp:
                     ("Supported documents", supported_input_patterns()),
                     ("Word documents", "*.doc *.docx"),
                     ("Excel documents", "*.xls *.xlsx *.xlsm *.xlsb"),
+                    ("PowerPoint documents", "*.ppt *.pptx *.pptm"),
                     ("All files", "*.*"),
                 ],
             )
