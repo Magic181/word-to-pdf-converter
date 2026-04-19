@@ -1,12 +1,13 @@
 # Word to PDF Converter
 
-A lightweight Windows tool for converting Word documents to PDF with high layout fidelity.
+A lightweight Windows tool for converting Word/Excel documents to PDF with high layout fidelity.
 
 This project uses `pywin32` to automate a locally installed Microsoft Word instance and export `.doc` or `.docx` files to PDF. It now supports both command-line usage and a desktop GUI, including batch conversion for entire directories.
 
 ## Features
 
-- Convert `.doc` and `.docx` files to PDF
+- Convert Word files (`.doc`, `.docx`) to PDF
+- Convert Excel files (`.xls`, `.xlsx`, `.xlsm`, `.xlsb`) to PDF
 - Launch a desktop GUI for easier everyday use
 - Support drag and drop for input files, input folders, and output targets in the GUI
 - Batch-convert all Word files in a directory

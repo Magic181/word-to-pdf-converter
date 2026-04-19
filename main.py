@@ -32,7 +32,10 @@ except ImportError:  # pragma: no cover - handled at runtime for missing depende
 
 
 WORD_SUFFIXES = {".doc", ".docx"}
+EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb"}
+SUPPORTED_INPUT_SUFFIXES = WORD_SUFFIXES | EXCEL_SUFFIXES
 WD_EXPORT_FORMAT_PDF = 17
+XL_TYPE_PDF = 0
 WD_DO_NOT_SAVE_CHANGES = 0
 WORD_EXIT_TIMEOUT_SECONDS = 5.0
 BATCH_SESSION_RESTART_FAILURE_THRESHOLD = 2
@@ -71,14 +74,42 @@ def is_word_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in WORD_SUFFIXES
 
 
+def is_excel_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in EXCEL_SUFFIXES
+
+
+def is_supported_input_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+
+
+def detect_input_kind(path: Path) -> str | None:
+    suffix = path.suffix.lower()
+    if suffix in WORD_SUFFIXES:
+        return "word"
+    if suffix in EXCEL_SUFFIXES:
+        return "excel"
+    return None
+
+
+def supported_input_patterns() -> str:
+    return " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_INPUT_SUFFIXES))
+
+
+def supported_input_label() -> str:
+    return ".doc/.docx/.xls/.xlsx/.xlsm/.xlsb"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert Word documents (.doc/.docx) to PDF on Windows."
+        description="Convert Word/Excel documents to PDF on Windows."
     )
     parser.add_argument(
         "input_path",
         nargs="?",
-        help="Path to a Word file or a directory containing Word files.",
+        help=(
+            "Path to a supported file or a directory containing supported files "
+            f"({supported_input_label()})."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -123,8 +154,10 @@ def resolve_input_path(input_path: str) -> Path:
 
 def resolve_file_paths(input_path: str, output_path: str | None) -> tuple[Path, Path]:
     source = resolve_input_path(input_path)
-    if not is_word_file(source):
-        raise ValueError("Input file must be a .doc or .docx document.")
+    if not is_supported_input_file(source):
+        raise ValueError(
+            f"Input file must be one of: {supported_input_label()}."
+        )
 
     if output_path:
         target = Path(output_path).expanduser().resolve()
@@ -137,14 +170,14 @@ def resolve_file_paths(input_path: str, output_path: str | None) -> tuple[Path, 
     return source, target
 
 
-def collect_word_files(directory: Path, recursive: bool = False) -> list[Path]:
+def collect_supported_files(directory: Path, recursive: bool = False) -> list[Path]:
     iterator: Iterable[Path]
     if recursive:
         iterator = directory.rglob("*")
     else:
         iterator = directory.iterdir()
 
-    files = [path for path in iterator if is_word_file(path)]
+    files = [path for path in iterator if is_supported_input_file(path)]
     return sorted(files, key=lambda path: str(path).lower())
 
 
@@ -180,11 +213,21 @@ def _get_word_process_id(word_app: object) -> int | None:
 
 
 def _wait_for_process_exit(pid: int, timeout_seconds: float) -> bool:
+    def is_process_running(process_id: int) -> bool:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {process_id}", "/FO", "CSV", "/NH"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        line = result.stdout.strip().strip('"')
+        if not line:
+            return False
+        return "No tasks are running" not in line and "INFO:" not in line
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not is_process_running(pid):
             return True
         time.sleep(0.1)
     return False
@@ -219,23 +262,25 @@ def _close_document(document: object | None) -> str | None:
     return None
 
 
-def _quit_word_application(word_app: object | None, pid: int | None) -> str | None:
-    if word_app is None:
+def _quit_office_application(
+    app_object: object | None, pid: int | None, app_name: str
+) -> str | None:
+    if app_object is None:
         return None
 
     quit_error: str | None = None
     try:
-        word_app.Quit(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+        app_object.Quit(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
     except Exception as exc:
-        quit_error = f"Word quit warning: {_format_com_error(exc)}"
+        quit_error = f"{app_name} quit warning: {_format_com_error(exc)}"
 
     if pid is not None and not _wait_for_process_exit(pid, WORD_EXIT_TIMEOUT_SECONDS):
         _force_terminate_process(pid)
         if not _wait_for_process_exit(pid, 2.0):
-            suffix = f"Word process {pid} is still running after forced termination."
+            suffix = f"{app_name} process {pid} is still running after forced termination."
             quit_error = f"{quit_error} {suffix}".strip() if quit_error else suffix
         else:
-            suffix = f"Word process {pid} did not exit cleanly and was terminated."
+            suffix = f"{app_name} process {pid} did not exit cleanly and was terminated."
             quit_error = f"{quit_error} {suffix}".strip() if quit_error else suffix
 
     return quit_error
@@ -265,7 +310,7 @@ class WordAutomationSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        quit_warning = _quit_word_application(self.word, self.word_pid)
+        quit_warning = _quit_office_application(self.word, self.word_pid, "Word")
         if quit_warning:
             self.cleanup_warnings.append(quit_warning)
         self.word = None
@@ -362,14 +407,135 @@ class WordAutomationSession:
         return ConversionOutcome(target=target, warning=warning)
 
 
+class ExcelAutomationSession:
+    def __init__(self) -> None:
+        self.excel = None
+        self.excel_pid: int | None = None
+        self.cleanup_warnings: list[str] = []
+        self._initialized = False
+
+    def __enter__(self) -> ExcelAutomationSession:
+        ensure_dependencies()
+        pythoncom.CoInitialize()
+        self._initialized = True
+        try:
+            self.excel = win32com.client.DispatchEx("Excel.Application")
+            self.excel.Visible = False
+            self.excel.DisplayAlerts = False
+            self.excel_pid = _get_word_process_id(self.excel)
+        except Exception:
+            if self._initialized:
+                pythoncom.CoUninitialize()
+                self._initialized = False
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        quit_warning = _quit_office_application(self.excel, self.excel_pid, "Excel")
+        if quit_warning:
+            self.cleanup_warnings.append(quit_warning)
+        self.excel = None
+        self.excel_pid = None
+        gc.collect()
+        if self._initialized:
+            pythoncom.CoUninitialize()
+            self._initialized = False
+
+    def convert_file(
+        self, source: Path, target: Path, overwrite: bool = False
+    ) -> ConversionOutcome:
+        if target.exists() and not overwrite:
+            raise FileExistsError(
+                f"Target file already exists: {target}. Use --overwrite to replace it."
+            )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WordConversionError(
+                f"Unable to create output directory: {target.parent} ({exc})",
+                source=source,
+            ) from exc
+
+        workbook = None
+        local_warnings: list[str] = []
+        try:
+            if self.excel is None:
+                raise WordConversionError(
+                    "Excel automation session is not available.",
+                    source=source,
+                )
+
+            workbook = self.excel.Workbooks.Open(
+                str(source),
+                ReadOnly=True,
+            )
+            workbook.ExportAsFixedFormat(XL_TYPE_PDF, str(target))
+        except com_error as exc:
+            details = _format_com_error(exc)
+            raise WordConversionError(
+                "Excel export failed. Make sure Microsoft Excel is installed and the document can be opened normally. "
+                f"Details: {details}",
+                source=source,
+            ) from exc
+        except Exception as exc:
+            if isinstance(exc, WordConversionError):
+                raise
+            raise WordConversionError(
+                f"Unexpected conversion failure for {source.name}: {exc}",
+                source=source,
+            ) from exc
+        finally:
+            close_warning = _close_document(workbook)
+            if close_warning:
+                local_warnings.append(close_warning.replace("Document", "Workbook"))
+            workbook = None
+
+        if not target.exists():
+            details = " ".join(local_warnings).strip()
+            message = f"Export did not create the PDF file: {target}"
+            if details:
+                message = f"{message} Cleanup notes: {details}"
+            raise WordConversionError(message, source=source)
+
+        warning = None
+        if local_warnings:
+            warning = (
+                "Converted successfully, but workbook cleanup reported warnings. "
+                f"{' '.join(local_warnings)}"
+            )
+
+        return ConversionOutcome(target=target, warning=warning)
+
+
 def convert_word_to_pdf(
     source: Path, target: Path, overwrite: bool = False
 ) -> ConversionOutcome:
-    with WordAutomationSession() as session:
+    kind = detect_input_kind(source)
+    if kind is None:
+        raise WordConversionError(
+            f"Unsupported input format: {source.suffix}. Supported: {supported_input_label()}",
+            source=source,
+        )
+
+    if kind == "word":
+        with WordAutomationSession() as session:
+            outcome = session.convert_file(source, target, overwrite=overwrite)
+            if session.cleanup_warnings:
+                cleanup_warning = (
+                    "Converted successfully, but Word cleanup reported warnings. "
+                    f"{' '.join(session.cleanup_warnings)}"
+                )
+                warning = " ".join(
+                    part for part in [outcome.warning, cleanup_warning] if part
+                )
+                return ConversionOutcome(target=outcome.target, warning=warning)
+            return outcome
+
+    with ExcelAutomationSession() as session:
         outcome = session.convert_file(source, target, overwrite=overwrite)
         if session.cleanup_warnings:
             cleanup_warning = (
-                "Converted successfully, but Word cleanup reported warnings. "
+                "Converted successfully, but Excel cleanup reported warnings. "
                 f"{' '.join(session.cleanup_warnings)}"
             )
             warning = " ".join(
@@ -377,6 +543,29 @@ def convert_word_to_pdf(
             )
             return ConversionOutcome(target=outcome.target, warning=warning)
         return outcome
+
+
+def _open_session_for_kind(kind: str):
+    if kind == "word":
+        return WordAutomationSession().__enter__()
+    if kind == "excel":
+        return ExcelAutomationSession().__enter__()
+    raise WordConversionError(f"Unsupported session kind: {kind}")
+
+
+def _extract_session_pid(session: object) -> int | None:
+    if hasattr(session, "word_pid"):
+        return getattr(session, "word_pid")
+    if hasattr(session, "excel_pid"):
+        return getattr(session, "excel_pid")
+    return None
+
+
+def _drain_session_warnings(session: object, collector: list[str]) -> None:
+    warnings = list(getattr(session, "cleanup_warnings", []))
+    if warnings:
+        collector.extend(warnings)
+        getattr(session, "cleanup_warnings").clear()
 
 
 def convert_directory_to_pdf(
@@ -390,9 +579,11 @@ def convert_directory_to_pdf(
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
 
-    files = collect_word_files(input_dir, recursive=recursive)
+    files = collect_supported_files(input_dir, recursive=recursive)
     if not files:
-        raise FileNotFoundError(f"No Word files found in directory: {input_dir}")
+        raise FileNotFoundError(
+            f"No supported files found in directory: {input_dir} ({supported_input_label()})"
+        )
 
     results: list[BatchResult] = []
     total = len(files)
@@ -401,9 +592,35 @@ def convert_directory_to_pdf(
     consecutive_failures = 0
     start_time = time.perf_counter()
 
-    session = WordAutomationSession().__enter__()
+    session = None
+    session_kind: str | None = None
     try:
         for index, source in enumerate(files, start=1):
+            kind = detect_input_kind(source)
+            if kind is None:
+                result = BatchResult(
+                    source=source,
+                    target=build_batch_target(source, input_dir, output_dir),
+                    success=False,
+                    message=(
+                        f"Unsupported input format: {source.suffix}. "
+                        f"Supported: {supported_input_label()}"
+                    ),
+                )
+                results.append(result)
+                if progress_callback is not None:
+                    progress_callback(index, total, result)
+                consecutive_failures += 1
+                continue
+
+            if session is None or session_kind != kind:
+                if session is not None:
+                    session.__exit__(None, None, None)
+                    _drain_session_warnings(session, cleanup_warnings)
+                session = _open_session_for_kind(kind)
+                session_kind = kind
+                consecutive_failures = 0
+
             target = build_batch_target(source, input_dir, output_dir)
             try:
                 outcome = session.convert_file(source, target, overwrite=overwrite)
@@ -427,18 +644,21 @@ def convert_directory_to_pdf(
             if progress_callback is not None:
                 progress_callback(index, total, result)
 
-            if consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD and index < total:
-                previous_pid = session.word_pid
+            if (
+                consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD
+                and index < total
+                and session is not None
+            ):
+                previous_pid = _extract_session_pid(session)
                 session.__exit__(None, None, None)
-                if session.cleanup_warnings:
-                    cleanup_warnings.extend(session.cleanup_warnings)
+                _drain_session_warnings(session, cleanup_warnings)
                 session_restarts += 1
                 consecutive_failures = 0
 
                 try:
-                    session = WordAutomationSession().__enter__()
+                    session = _open_session_for_kind(session_kind or "word")
                     restart_message = (
-                        "Word session restarted after consecutive failures to isolate subsequent files."
+                        f"{session_kind.capitalize() if session_kind else 'Office'} session restarted after consecutive failures to isolate subsequent files."
                     )
                     if previous_pid is not None:
                         restart_message = f"{restart_message} Previous PID: {previous_pid}."
@@ -452,12 +672,12 @@ def convert_directory_to_pdf(
                         progress_callback(index, total, info_result)
                 except Exception as restart_exc:
                     raise WordConversionError(
-                        f"Unable to restart Word after consecutive failures: {restart_exc}"
+                        f"Unable to restart {session_kind or 'office'} session after consecutive failures: {restart_exc}"
                     ) from restart_exc
     finally:
-        session.__exit__(None, None, None)
-        if session.cleanup_warnings:
-            cleanup_warnings.extend(session.cleanup_warnings)
+        if session is not None:
+            session.__exit__(None, None, None)
+            _drain_session_warnings(session, cleanup_warnings)
 
     cleanup_warning = None
     if cleanup_warnings:
@@ -484,11 +704,13 @@ def convert_file_list_to_pdf(
     progress_callback: Callable[[int, int, BatchResult], None] | None = None,
 ) -> BatchConversionOutcome:
     if not sources:
-        raise FileNotFoundError("No Word files were provided for batch conversion.")
+        raise FileNotFoundError("No files were provided for batch conversion.")
 
-    files = [path.resolve() for path in sources if is_word_file(path.resolve())]
+    files = [path.resolve() for path in sources if is_supported_input_file(path.resolve())]
     if not files:
-        raise FileNotFoundError("No valid Word files were provided for batch conversion.")
+        raise FileNotFoundError(
+            f"No valid supported files were provided for batch conversion ({supported_input_label()})."
+        )
 
     results: list[BatchResult] = []
     cleanup_warnings: list[str] = []
@@ -497,9 +719,35 @@ def convert_file_list_to_pdf(
     total = len(files)
     start_time = time.perf_counter()
 
-    session = WordAutomationSession().__enter__()
+    session = None
+    session_kind: str | None = None
     try:
         for index, source in enumerate(files, start=1):
+            kind = detect_input_kind(source)
+            if kind is None:
+                result = BatchResult(
+                    source=source,
+                    target=build_list_target(source, output_dir),
+                    success=False,
+                    message=(
+                        f"Unsupported input format: {source.suffix}. "
+                        f"Supported: {supported_input_label()}"
+                    ),
+                )
+                results.append(result)
+                if progress_callback is not None:
+                    progress_callback(index, total, result)
+                consecutive_failures += 1
+                continue
+
+            if session is None or session_kind != kind:
+                if session is not None:
+                    session.__exit__(None, None, None)
+                    _drain_session_warnings(session, cleanup_warnings)
+                session = _open_session_for_kind(kind)
+                session_kind = kind
+                consecutive_failures = 0
+
             target = build_list_target(source, output_dir)
             try:
                 outcome = session.convert_file(source, target, overwrite=overwrite)
@@ -523,18 +771,21 @@ def convert_file_list_to_pdf(
             if progress_callback is not None:
                 progress_callback(index, total, result)
 
-            if consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD and index < total:
-                previous_pid = session.word_pid
+            if (
+                consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD
+                and index < total
+                and session is not None
+            ):
+                previous_pid = _extract_session_pid(session)
                 session.__exit__(None, None, None)
-                if session.cleanup_warnings:
-                    cleanup_warnings.extend(session.cleanup_warnings)
+                _drain_session_warnings(session, cleanup_warnings)
                 session_restarts += 1
                 consecutive_failures = 0
 
                 try:
-                    session = WordAutomationSession().__enter__()
+                    session = _open_session_for_kind(session_kind or "word")
                     restart_message = (
-                        "Word session restarted after consecutive failures to isolate subsequent files."
+                        f"{session_kind.capitalize() if session_kind else 'Office'} session restarted after consecutive failures to isolate subsequent files."
                     )
                     if previous_pid is not None:
                         restart_message = f"{restart_message} Previous PID: {previous_pid}."
@@ -548,12 +799,12 @@ def convert_file_list_to_pdf(
                         progress_callback(index, total, info_result)
                 except Exception as restart_exc:
                     raise WordConversionError(
-                        f"Unable to restart Word after consecutive failures: {restart_exc}"
+                        f"Unable to restart {session_kind or 'office'} session after consecutive failures: {restart_exc}"
                     ) from restart_exc
     finally:
-        session.__exit__(None, None, None)
-        if session.cleanup_warnings:
-            cleanup_warnings.extend(session.cleanup_warnings)
+        if session is not None:
+            session.__exit__(None, None, None)
+            _drain_session_warnings(session, cleanup_warnings)
 
     cleanup_warning = None
     if cleanup_warnings:
@@ -641,8 +892,8 @@ class WordToPdfApp:
         self.failures_only_var = tk.BooleanVar(value=False)
         self.drop_hint_var = tk.StringVar(
             value=(
-                "Drag a Word file or folder onto the window. "
-                "You can also drop multiple Word files for a one-off batch."
+                "Drag a Word/Excel file or folder onto the window. "
+                "You can also drop multiple supported files for a one-off batch."
                 if TkinterDnD is not None
                 else "Install tkinterdnd2 to enable drag and drop."
             )
@@ -1006,7 +1257,7 @@ class WordToPdfApp:
 
         ttk.Label(
             self.pending_frame,
-            text="Files dropped for one-off batch conversion",
+            text="Files dropped for one-off batch conversion (.doc/.docx/.xls/.xlsx/.xlsm/.xlsb)",
             style="Muted.TLabel",
         ).grid(row=0, column=0, sticky="w")
 
@@ -1300,8 +1551,8 @@ class WordToPdfApp:
         self.dropped_files = []
         self._refresh_pending_file_list()
         self.drop_hint_var.set(
-            "Drag a Word file or folder onto the window. "
-            "You can also drop multiple Word files for a one-off batch."
+            "Drag a Word/Excel file or folder onto the window. "
+            "You can also drop multiple supported files for a one-off batch."
             if TkinterDnD is not None
             else "Install tkinterdnd2 to enable drag and drop."
         )
@@ -1317,14 +1568,14 @@ class WordToPdfApp:
         if self.dropped_files:
             if not self.pending_frame.winfo_manager():
                 self.pending_frame.pack(fill="x", pady=(16, 0))
-            self.input_var.set(f"{len(self.dropped_files)} dropped Word files")
+            self.input_var.set(f"{len(self.dropped_files)} dropped files")
             self.drop_hint_var.set(
-                f"Using {len(self.dropped_files)} dropped Word files for a one-off batch conversion."
+                f"Using {len(self.dropped_files)} dropped files for a one-off batch conversion."
             )
         else:
             if self.pending_frame.winfo_manager():
                 self.pending_frame.pack_forget()
-            if self.input_var.get().endswith("dropped Word files"):
+            if self.input_var.get().endswith("dropped files"):
                 self.input_var.set("")
 
     def _remove_selected_dropped_files(self) -> None:
@@ -1369,11 +1620,11 @@ class WordToPdfApp:
         if not self.output_var.get().strip():
             self.output_var.set(str(first_parent))
         self.drop_hint_var.set(
-            f"Using {len(files)} dropped Word files for a one-off batch conversion."
+            f"Using {len(files)} dropped files for a one-off batch conversion."
         )
         self._refresh_pending_file_list()
         self.status_var.set(
-            f"Prepared a dropped-file batch with {len(files)} Word files."
+            f"Prepared a dropped-file batch with {len(files)} files."
         )
         self._handle_drop_leave(None)
 
@@ -1398,28 +1649,28 @@ class WordToPdfApp:
             self._handle_drop_leave(event)
             return "break"
 
-        word_files = [path for path in paths if is_word_file(path)]
-        invalid_paths = [path for path in paths if not is_word_file(path) and not path.is_dir()]
+        supported_files = [path for path in paths if is_supported_input_file(path)]
+        invalid_paths = [path for path in paths if not is_supported_input_file(path) and not path.is_dir()]
         dropped_directories = [path for path in paths if path.is_dir()]
 
         if invalid_paths:
             names = ", ".join(path.name for path in invalid_paths[:3])
             suffix = " ..." if len(invalid_paths) > 3 else ""
             return self._show_drop_error(
-                f"Only Word files or folders can be dropped as input. Unsupported item(s): {names}{suffix}"
+                f"Only supported files ({supported_input_label()}) or folders can be dropped as input. Unsupported item(s): {names}{suffix}"
             )
 
         if dropped_directories and len(paths) > 1:
             return self._show_drop_error(
-                "Please drop either one folder or one/multiple Word files, not a mixed selection."
+                "Please drop either one folder or one/multiple supported files, not a mixed selection."
             )
 
-        if len(word_files) > 1:
-            self._set_batch_file_drop(word_files)
+        if len(supported_files) > 1:
+            self._set_batch_file_drop(supported_files)
             return "break"
 
-        if len(word_files) == 1:
-            path = word_files[0]
+        if len(supported_files) == 1:
+            path = supported_files[0]
             self.dropped_files = []
             self._refresh_pending_file_list()
             self.mode_var.set("file")
@@ -1435,7 +1686,7 @@ class WordToPdfApp:
             return "break"
 
         return self._show_drop_error(
-            "Only Word files or directories can be dropped as input."
+            f"Only supported files ({supported_input_label()}) or directories can be dropped as input."
         )
 
     def _handle_output_drop(self, event: object) -> str:
@@ -1478,8 +1729,13 @@ class WordToPdfApp:
             selected = filedialog.askdirectory(title="Select input directory")
         else:
             selected = filedialog.askopenfilename(
-                title="Select Word file",
-                filetypes=[("Word documents", "*.doc *.docx"), ("All files", "*.*")],
+                title="Select input file",
+                filetypes=[
+                    ("Supported documents", supported_input_patterns()),
+                    ("Word documents", "*.doc *.docx"),
+                    ("Excel documents", "*.xls *.xlsx *.xlsm *.xlsb"),
+                    ("All files", "*.*"),
+                ],
             )
         if selected:
             self._clear_dropped_files()
