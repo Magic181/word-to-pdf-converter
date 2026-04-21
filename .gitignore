@@ -4,3 +4,6 @@ __pycache__/
 *.pyd
 .venv/
 需求.md
+
+app_config.json
+office_to_pdf.log

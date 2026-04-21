@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import json
+import logging
 import os
 import queue
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -38,9 +41,15 @@ SUPPORTED_INPUT_SUFFIXES = WORD_SUFFIXES | EXCEL_SUFFIXES | POWERPOINT_SUFFIXES
 WD_EXPORT_FORMAT_PDF = 17
 XL_TYPE_PDF = 0
 PP_SAVE_AS_PDF = 32
+PP_FIXED_FORMAT_TYPE_PDF = 2
 WD_DO_NOT_SAVE_CHANGES = 0
 WORD_EXIT_TIMEOUT_SECONDS = 5.0
 BATCH_SESSION_RESTART_FAILURE_THRESHOLD = 2
+DEFAULT_RETRY_ATTEMPTS = 1
+DEFAULT_BATCH_WORKERS = 1
+DEFAULT_WATCH_INTERVAL_SECONDS = 3.0
+APP_CONFIG_PATH = Path(__file__).with_name("app_config.json")
+APP_LOG_PATH = Path(__file__).with_name("office_to_pdf.log")
 
 
 class WordConversionError(RuntimeError):
@@ -70,6 +79,76 @@ class BatchConversionOutcome:
     duration_seconds: float = 0.0
     reused_single_session: bool = True
     session_restarts: int = 0
+    parallel_workers_used: int = 1
+
+
+@dataclass(slots=True)
+class AppConfig:
+    mode: str = "file"
+    last_input: str = ""
+    last_output: str = ""
+    recursive: bool = False
+    overwrite: bool = False
+    failures_only: bool = False
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    batch_workers: int = DEFAULT_BATCH_WORKERS
+    watch_enabled: bool = False
+    watch_interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("office_to_pdf")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
+    )
+
+    file_handler = logging.FileHandler(APP_LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+LOGGER = setup_logging()
+
+
+def load_app_config() -> AppConfig:
+    if not APP_CONFIG_PATH.exists():
+        return AppConfig()
+
+    try:
+        raw = json.loads(APP_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Unable to load config from %s: %s", APP_CONFIG_PATH, exc)
+        return AppConfig()
+
+    config = AppConfig()
+    for field_name in config.__dataclass_fields__:
+        if field_name in raw:
+            setattr(config, field_name, raw[field_name])
+
+    config.mode = config.mode if config.mode in {"file", "directory"} else "file"
+    config.retry_attempts = max(0, int(config.retry_attempts))
+    config.batch_workers = max(1, int(config.batch_workers))
+    config.watch_interval_seconds = max(1.0, float(config.watch_interval_seconds))
+    return config
+
+
+def save_app_config(config: AppConfig) -> None:
+    try:
+        APP_CONFIG_PATH.write_text(
+            json.dumps(asdict(config), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        LOGGER.warning("Unable to save config to %s: %s", APP_CONFIG_PATH, exc)
 
 
 def is_word_file(path: Path) -> bool:
@@ -105,7 +184,7 @@ def supported_input_label() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert Word/Excel documents to PDF on Windows."
+        description="Convert Office documents to PDF on Windows."
     )
     parser.add_argument(
         "input_path",
@@ -138,6 +217,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--gui",
         action="store_true",
         help="Launch the desktop GUI.",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_RETRY_ATTEMPTS,
+        help="Retry a failed file this many extra times before marking it as failed.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_BATCH_WORKERS,
+        help="Number of parallel batch workers. Values above 1 may open multiple Office instances.",
     )
     return parser
 
@@ -296,22 +387,29 @@ def _quit_office_application(
     return quit_error
 
 
-class WordAutomationSession:
+class OfficeAutomationSession:
+    app_name = "Office"
+    prog_id = ""
+    visible = False
+    resource_label = "Document"
+    cleanup_subject = "document"
+    unavailable_message = "Office automation session is not available."
+    export_failure_message = "Office export failed."
+
     def __init__(self) -> None:
-        self.word = None
-        self.word_pid: int | None = None
+        self.app = None
+        self.pid: int | None = None
         self.cleanup_warnings: list[str] = []
         self._initialized = False
 
-    def __enter__(self) -> WordAutomationSession:
+    def __enter__(self):
         ensure_dependencies()
         pythoncom.CoInitialize()
         self._initialized = True
         try:
-            self.word = win32com.client.DispatchEx("Word.Application")
-            self.word.Visible = False
-            self.word.DisplayAlerts = 0
-            self.word_pid = _get_word_process_id(self.word)
+            self.app = win32com.client.DispatchEx(self.prog_id)
+            self._configure_application()
+            self.pid = _get_word_process_id(self.app)
         except Exception:
             if self._initialized:
                 pythoncom.CoUninitialize()
@@ -320,19 +418,21 @@ class WordAutomationSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        quit_warning = _quit_office_application(self.word, self.word_pid, "Word")
+        quit_warning = _quit_office_application(self.app, self.pid, self.app_name)
         if quit_warning:
             self.cleanup_warnings.append(quit_warning)
-        self.word = None
-        self.word_pid = None
+        self.app = None
+        self.pid = None
         gc.collect()
         if self._initialized:
             pythoncom.CoUninitialize()
             self._initialized = False
 
-    def _prepare_target(
-        self, source: Path, target: Path, overwrite: bool
-    ) -> None:
+    def _configure_application(self) -> None:
+        if self.app is not None:
+            self.app.Visible = self.visible
+
+    def _prepare_target(self, source: Path, target: Path, overwrite: bool) -> None:
         if target.exists() and not overwrite:
             raise FileExistsError(
                 f"Target file already exists: {target}. Use --overwrite to replace it."
@@ -344,47 +444,36 @@ class WordAutomationSession:
                 f"Unable to create output directory: {target.parent} ({exc})",
                 source=source,
             ) from exc
+
+    def _close_resource(self, resource: object | None) -> str | None:
+        warning = _close_document(resource)
+        if warning and self.resource_label != "Document":
+            return warning.replace("Document", self.resource_label)
+        return warning
+
+    def _open_resource(self, source: Path) -> object:
+        raise NotImplementedError
+
+    def _export_resource(self, resource: object, target: Path) -> None:
+        raise NotImplementedError
 
     def convert_file(
         self, source: Path, target: Path, overwrite: bool = False
     ) -> ConversionOutcome:
         self._prepare_target(source, target, overwrite)
 
-        document = None
+        resource = None
         local_warnings: list[str] = []
         try:
-            if self.word is None:
-                raise WordConversionError(
-                    "Word automation session is not available.",
-                    source=source,
-                )
+            if self.app is None:
+                raise WordConversionError(self.unavailable_message, source=source)
 
-            document = self.word.Documents.Open(
-                str(source),
-                ConfirmConversions=False,
-                ReadOnly=True,
-                AddToRecentFiles=False,
-                Visible=False,
-            )
-            document.ExportAsFixedFormat(
-                OutputFileName=str(target),
-                ExportFormat=WD_EXPORT_FORMAT_PDF,
-                OpenAfterExport=False,
-                OptimizeFor=0,
-                Range=0,
-                Item=0,
-                IncludeDocProps=True,
-                KeepIRM=True,
-                CreateBookmarks=1,
-                DocStructureTags=True,
-                BitmapMissingFonts=True,
-                UseISO19005_1=False,
-            )
+            resource = self._open_resource(source)
+            self._export_resource(resource, target)
         except com_error as exc:
             details = _format_com_error(exc)
             raise WordConversionError(
-                "Word export failed. Make sure Microsoft Word is installed and the document can be opened normally. "
-                f"Details: {details}",
+                f"{self.export_failure_message} Details: {details}",
                 source=source,
             ) from exc
         except Exception as exc:
@@ -395,10 +484,9 @@ class WordAutomationSession:
                 source=source,
             ) from exc
         finally:
-            close_warning = _close_document(document)
+            close_warning = self._close_resource(resource)
             if close_warning:
                 local_warnings.append(close_warning)
-            document = None
 
         if not target.exists():
             details = " ".join(local_warnings).strip()
@@ -410,217 +498,128 @@ class WordAutomationSession:
         warning = None
         if local_warnings:
             warning = (
-                "Converted successfully, but document cleanup reported warnings. "
+                f"Converted successfully, but {self.cleanup_subject} cleanup reported warnings. "
                 f"{' '.join(local_warnings)}"
             )
-
         return ConversionOutcome(target=target, warning=warning)
 
 
-class ExcelAutomationSession:
-    def __init__(self) -> None:
-        self.excel = None
-        self.excel_pid: int | None = None
-        self.cleanup_warnings: list[str] = []
-        self._initialized = False
+class WordAutomationSession(OfficeAutomationSession):
+    app_name = "Word"
+    prog_id = "Word.Application"
+    visible = False
+    resource_label = "Document"
+    cleanup_subject = "document"
+    unavailable_message = "Word automation session is not available."
+    export_failure_message = (
+        "Word export failed. Make sure Microsoft Word is installed and the document can be opened normally."
+    )
 
-    def __enter__(self) -> ExcelAutomationSession:
-        ensure_dependencies()
-        pythoncom.CoInitialize()
-        self._initialized = True
-        try:
-            self.excel = win32com.client.DispatchEx("Excel.Application")
-            self.excel.Visible = False
-            self.excel.DisplayAlerts = False
-            self.excel_pid = _get_word_process_id(self.excel)
-        except Exception:
-            if self._initialized:
-                pythoncom.CoUninitialize()
-                self._initialized = False
-            raise
-        return self
+    def _configure_application(self) -> None:
+        super()._configure_application()
+        if self.app is not None:
+            self.app.DisplayAlerts = 0
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        quit_warning = _quit_office_application(self.excel, self.excel_pid, "Excel")
-        if quit_warning:
-            self.cleanup_warnings.append(quit_warning)
-        self.excel = None
-        self.excel_pid = None
-        gc.collect()
-        if self._initialized:
-            pythoncom.CoUninitialize()
-            self._initialized = False
-
-    def convert_file(
-        self, source: Path, target: Path, overwrite: bool = False
-    ) -> ConversionOutcome:
-        if target.exists() and not overwrite:
-            raise FileExistsError(
-                f"Target file already exists: {target}. Use --overwrite to replace it."
-            )
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise WordConversionError(
-                f"Unable to create output directory: {target.parent} ({exc})",
-                source=source,
-            ) from exc
-
-        workbook = None
-        local_warnings: list[str] = []
-        try:
-            if self.excel is None:
-                raise WordConversionError(
-                    "Excel automation session is not available.",
-                    source=source,
-                )
-
-            workbook = self.excel.Workbooks.Open(
-                str(source),
-                ReadOnly=True,
-            )
-            workbook.ExportAsFixedFormat(XL_TYPE_PDF, str(target))
-        except com_error as exc:
-            details = _format_com_error(exc)
-            raise WordConversionError(
-                "Excel export failed. Make sure Microsoft Excel is installed and the document can be opened normally. "
-                f"Details: {details}",
-                source=source,
-            ) from exc
-        except Exception as exc:
-            if isinstance(exc, WordConversionError):
-                raise
-            raise WordConversionError(
-                f"Unexpected conversion failure for {source.name}: {exc}",
-                source=source,
-            ) from exc
-        finally:
-            close_warning = _close_document(workbook)
-            if close_warning:
-                local_warnings.append(close_warning.replace("Document", "Workbook"))
-            workbook = None
-
-        if not target.exists():
-            details = " ".join(local_warnings).strip()
-            message = f"Export did not create the PDF file: {target}"
-            if details:
-                message = f"{message} Cleanup notes: {details}"
-            raise WordConversionError(message, source=source)
-
-        warning = None
-        if local_warnings:
-            warning = (
-                "Converted successfully, but workbook cleanup reported warnings. "
-                f"{' '.join(local_warnings)}"
-            )
-
-        return ConversionOutcome(target=target, warning=warning)
-
-
-class PowerPointAutomationSession:
-    def __init__(self) -> None:
-        self.powerpoint = None
-        self.powerpoint_pid: int | None = None
-        self.cleanup_warnings: list[str] = []
-        self._initialized = False
-
-    def __enter__(self) -> PowerPointAutomationSession:
-        ensure_dependencies()
-        pythoncom.CoInitialize()
-        self._initialized = True
-        try:
-            self.powerpoint = win32com.client.DispatchEx("PowerPoint.Application")
-            self.powerpoint.Visible = True
-            self.powerpoint_pid = _get_word_process_id(self.powerpoint)
-        except Exception:
-            if self._initialized:
-                pythoncom.CoUninitialize()
-                self._initialized = False
-            raise
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        quit_warning = _quit_office_application(
-            self.powerpoint, self.powerpoint_pid, "PowerPoint"
+    def _open_resource(self, source: Path) -> object:
+        return self.app.Documents.Open(
+            str(source),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
         )
-        if quit_warning:
-            self.cleanup_warnings.append(quit_warning)
-        self.powerpoint = None
-        self.powerpoint_pid = None
-        gc.collect()
-        if self._initialized:
-            pythoncom.CoUninitialize()
-            self._initialized = False
 
-    def convert_file(
-        self, source: Path, target: Path, overwrite: bool = False
-    ) -> ConversionOutcome:
-        if target.exists() and not overwrite:
-            raise FileExistsError(
-                f"Target file already exists: {target}. Use --overwrite to replace it."
-            )
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise WordConversionError(
-                f"Unable to create output directory: {target.parent} ({exc})",
-                source=source,
-            ) from exc
-
-        presentation = None
-        local_warnings: list[str] = []
-        try:
-            if self.powerpoint is None:
-                raise WordConversionError(
-                    "PowerPoint automation session is not available.",
-                    source=source,
-                )
-
-            presentation = self.powerpoint.Presentations.Open(
-                str(source),
-                ReadOnly=True,
-                Untitled=False,
-                WithWindow=False,
-            )
-            presentation.SaveAs(str(target), PP_SAVE_AS_PDF)
-        except com_error as exc:
-            details = _format_com_error(exc)
-            raise WordConversionError(
-                "PowerPoint export failed. Make sure Microsoft PowerPoint is installed and the document can be opened normally. "
-                f"Details: {details}",
-                source=source,
-            ) from exc
-        except Exception as exc:
-            if isinstance(exc, WordConversionError):
-                raise
-            raise WordConversionError(
-                f"Unexpected conversion failure for {source.name}: {exc}",
-                source=source,
-            ) from exc
-        finally:
-            close_warning = _close_document(presentation)
-            if close_warning:
-                local_warnings.append(close_warning.replace("Document", "Presentation"))
-            presentation = None
-
-        if not target.exists():
-            details = " ".join(local_warnings).strip()
-            message = f"Export did not create the PDF file: {target}"
-            if details:
-                message = f"{message} Cleanup notes: {details}"
-            raise WordConversionError(message, source=source)
-
-        warning = None
-        if local_warnings:
-            warning = (
-                "Converted successfully, but presentation cleanup reported warnings. "
-                f"{' '.join(local_warnings)}"
-            )
-
-        return ConversionOutcome(target=target, warning=warning)
+    def _export_resource(self, resource: object, target: Path) -> None:
+        resource.ExportAsFixedFormat(
+            OutputFileName=str(target),
+            ExportFormat=WD_EXPORT_FORMAT_PDF,
+            OpenAfterExport=False,
+            OptimizeFor=0,
+            Range=0,
+            Item=0,
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=1,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
 
 
-def convert_word_to_pdf(
+class ExcelAutomationSession(OfficeAutomationSession):
+    app_name = "Excel"
+    prog_id = "Excel.Application"
+    visible = False
+    resource_label = "Workbook"
+    cleanup_subject = "workbook"
+    unavailable_message = "Excel automation session is not available."
+    export_failure_message = (
+        "Excel export failed. Make sure Microsoft Excel is installed and the document can be opened normally."
+    )
+
+    def _configure_application(self) -> None:
+        super()._configure_application()
+        if self.app is not None:
+            self.app.DisplayAlerts = False
+
+    def _open_resource(self, source: Path) -> object:
+        return self.app.Workbooks.Open(str(source), ReadOnly=True)
+
+    def _export_resource(self, resource: object, target: Path) -> None:
+        resource.ExportAsFixedFormat(
+            Type=XL_TYPE_PDF,
+            Filename=str(target),
+            OpenAfterPublish=False,
+        )
+
+
+class PowerPointAutomationSession(OfficeAutomationSession):
+    app_name = "PowerPoint"
+    prog_id = "PowerPoint.Application"
+    visible = True
+    resource_label = "Presentation"
+    cleanup_subject = "presentation"
+    unavailable_message = "PowerPoint automation session is not available."
+    export_failure_message = (
+        "PowerPoint export failed. Make sure Microsoft PowerPoint is installed and the document can be opened normally."
+    )
+
+    def _open_resource(self, source: Path) -> object:
+        return self.app.Presentations.Open(
+            str(source),
+            ReadOnly=True,
+            Untitled=False,
+            WithWindow=False,
+        )
+
+    def _export_resource(self, resource: object, target: Path) -> None:
+        resource.ExportAsFixedFormat(
+            str(target),
+            PP_FIXED_FORMAT_TYPE_PDF,
+            1,
+            False,
+            2,
+            1,
+            False,
+            None,
+        )
+
+
+def _merge_outcome_cleanup_warnings(
+    outcome: ConversionOutcome, session: OfficeAutomationSession
+) -> ConversionOutcome:
+    if not session.cleanup_warnings:
+        return outcome
+
+    cleanup_warning = (
+        f"Converted successfully, but {session.app_name} cleanup reported warnings. "
+        f"{' '.join(session.cleanup_warnings)}"
+    )
+    warning = " ".join(part for part in [outcome.warning, cleanup_warning] if part)
+    return ConversionOutcome(target=outcome.target, warning=warning)
+
+
+def convert_supported_file_to_pdf(
     source: Path, target: Path, overwrite: bool = False
 ) -> ConversionOutcome:
     kind = detect_input_kind(source)
@@ -630,46 +629,20 @@ def convert_word_to_pdf(
             source=source,
         )
 
-    if kind == "word":
-        with WordAutomationSession() as session:
-            outcome = session.convert_file(source, target, overwrite=overwrite)
-            if session.cleanup_warnings:
-                cleanup_warning = (
-                    "Converted successfully, but Word cleanup reported warnings. "
-                    f"{' '.join(session.cleanup_warnings)}"
-                )
-                warning = " ".join(
-                    part for part in [outcome.warning, cleanup_warning] if part
-                )
-                return ConversionOutcome(target=outcome.target, warning=warning)
-            return outcome
-
-    if kind == "excel":
-        with ExcelAutomationSession() as session:
-            outcome = session.convert_file(source, target, overwrite=overwrite)
-            if session.cleanup_warnings:
-                cleanup_warning = (
-                    "Converted successfully, but Excel cleanup reported warnings. "
-                    f"{' '.join(session.cleanup_warnings)}"
-                )
-                warning = " ".join(
-                    part for part in [outcome.warning, cleanup_warning] if part
-                )
-                return ConversionOutcome(target=outcome.target, warning=warning)
-            return outcome
-
-    with PowerPointAutomationSession() as session:
+    session_class = {
+        "word": WordAutomationSession,
+        "excel": ExcelAutomationSession,
+        "powerpoint": PowerPointAutomationSession,
+    }[kind]
+    with session_class() as session:
         outcome = session.convert_file(source, target, overwrite=overwrite)
-        if session.cleanup_warnings:
-            cleanup_warning = (
-                "Converted successfully, but PowerPoint cleanup reported warnings. "
-                f"{' '.join(session.cleanup_warnings)}"
-            )
-            warning = " ".join(
-                part for part in [outcome.warning, cleanup_warning] if part
-            )
-            return ConversionOutcome(target=outcome.target, warning=warning)
-        return outcome
+        return _merge_outcome_cleanup_warnings(outcome, session)
+
+
+def convert_word_to_pdf(
+    source: Path, target: Path, overwrite: bool = False
+) -> ConversionOutcome:
+    return convert_supported_file_to_pdf(source, target, overwrite=overwrite)
 
 
 def _open_session_for_kind(kind: str):
@@ -683,13 +656,7 @@ def _open_session_for_kind(kind: str):
 
 
 def _extract_session_pid(session: object) -> int | None:
-    if hasattr(session, "word_pid"):
-        return getattr(session, "word_pid")
-    if hasattr(session, "excel_pid"):
-        return getattr(session, "excel_pid")
-    if hasattr(session, "powerpoint_pid"):
-        return getattr(session, "powerpoint_pid")
-    return None
+    return getattr(session, "pid", None)
 
 
 def _drain_session_warnings(session: object, collector: list[str]) -> None:
@@ -698,6 +665,276 @@ def _drain_session_warnings(session: object, collector: list[str]) -> None:
         collector.extend(warnings)
         getattr(session, "cleanup_warnings").clear()
 
+@dataclass(slots=True)
+class BatchTask:
+    index: int
+    source: Path
+    target: Path
+    kind: str
+
+
+class ProgressTracker:
+    def __init__(
+        self,
+        total: int,
+        callback: Callable[[int, int, BatchResult], None] | None,
+    ) -> None:
+        self.total = total
+        self.callback = callback
+        self._completed = 0
+        self._lock = threading.Lock()
+
+    def emit(self, result: BatchResult) -> None:
+        if self.callback is None:
+            return
+        with self._lock:
+            self._completed += 1
+            completed = self._completed
+        self.callback(completed, self.total, result)
+
+
+def _normalize_supported_sources(sources: Iterable[Path]) -> list[Path]:
+    files = [path.resolve() for path in sources if is_supported_input_file(path.resolve())]
+    if not files:
+        raise FileNotFoundError(
+            f"No valid supported files were provided for batch conversion ({supported_input_label()})."
+        )
+    return files
+
+
+def _build_batch_tasks(
+    sources: list[Path],
+    target_builder: Callable[[Path], Path],
+) -> list[BatchTask]:
+    tasks: list[BatchTask] = []
+    for index, source in enumerate(sources):
+        kind = detect_input_kind(source)
+        if kind is None:
+            continue
+        tasks.append(
+            BatchTask(
+                index=index,
+                source=source,
+                target=target_builder(source),
+                kind=kind,
+            )
+        )
+    return tasks
+
+
+def _restart_session(
+    session: OfficeAutomationSession | None,
+    kind: str,
+    cleanup_warnings: list[str],
+) -> OfficeAutomationSession:
+    if session is not None:
+        session.__exit__(None, None, None)
+        _drain_session_warnings(session, cleanup_warnings)
+    try:
+        return _open_session_for_kind(kind)
+    except Exception as exc:
+        raise WordConversionError(f"Unable to start {kind} session: {exc}") from exc
+
+
+def _convert_with_retries(
+    session: OfficeAutomationSession,
+    task: BatchTask,
+    *,
+    overwrite: bool,
+    retry_attempts: int,
+    cleanup_warnings: list[str],
+) -> tuple[OfficeAutomationSession, ConversionOutcome, int]:
+    restarts = 0
+    active_session = session
+    last_error: Exception | None = None
+    total_attempts = retry_attempts + 1
+
+    for attempt in range(1, total_attempts + 1):
+        try:
+            outcome = active_session.convert_file(
+                task.source,
+                task.target,
+                overwrite=overwrite,
+            )
+            return active_session, outcome, restarts
+        except Exception as exc:
+            last_error = exc
+            LOGGER.warning(
+                "Conversion attempt %s/%s failed for %s: %s",
+                attempt,
+                total_attempts,
+                task.source,
+                exc,
+            )
+            if attempt >= total_attempts:
+                break
+            active_session = _restart_session(active_session, task.kind, cleanup_warnings)
+            restarts += 1
+
+    assert last_error is not None
+    raise last_error
+
+
+def _process_task_chunk(
+    tasks: list[BatchTask],
+    *,
+    overwrite: bool,
+    retry_attempts: int,
+    progress_tracker: ProgressTracker,
+) -> tuple[list[BatchTask], list[BatchResult], list[str], int]:
+    if not tasks:
+        return [], [], [], 0
+
+    results: list[BatchResult] = []
+    cleanup_warnings: list[str] = []
+    session_restarts = 0
+    consecutive_failures = 0
+    session: OfficeAutomationSession | None = None
+    current_kind: str | None = None
+
+    try:
+        for offset, task in enumerate(tasks):
+            if session is None or current_kind != task.kind:
+                session = _restart_session(session, task.kind, cleanup_warnings)
+                current_kind = task.kind
+                consecutive_failures = 0
+
+            try:
+                session, outcome, retry_restarts = _convert_with_retries(
+                    session,
+                    task,
+                    overwrite=overwrite,
+                    retry_attempts=retry_attempts,
+                    cleanup_warnings=cleanup_warnings,
+                )
+                session_restarts += retry_restarts
+                result = BatchResult(
+                    source=task.source,
+                    target=task.target,
+                    success=True,
+                    message=outcome.warning or "Converted successfully.",
+                )
+                consecutive_failures = 0
+            except Exception as exc:
+                result = BatchResult(
+                    source=task.source,
+                    target=task.target,
+                    success=False,
+                    message=str(exc),
+                )
+                consecutive_failures += 1
+
+            results.append(result)
+            progress_tracker.emit(result)
+
+            if (
+                consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD
+                and offset < len(tasks) - 1
+                and session is not None
+            ):
+                previous_pid = _extract_session_pid(session)
+                session = _restart_session(session, task.kind, cleanup_warnings)
+                session_restarts += 1
+                consecutive_failures = 0
+                LOGGER.warning(
+                    "Restarted %s session after consecutive failures. Previous PID=%s",
+                    task.kind,
+                    previous_pid,
+                )
+    finally:
+        if session is not None:
+            session.__exit__(None, None, None)
+            _drain_session_warnings(session, cleanup_warnings)
+
+    return tasks, results, cleanup_warnings, session_restarts
+
+
+def _split_tasks_for_parallelism(
+    tasks: list[BatchTask], max_workers: int
+) -> list[list[BatchTask]]:
+    worker_count = max(1, min(max_workers, len(tasks)))
+    if worker_count == 1:
+        return [tasks]
+
+    chunks: list[list[BatchTask]] = [[] for _ in range(worker_count)]
+    for index, task in enumerate(tasks):
+        chunks[index % worker_count].append(task)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _run_batch_tasks(
+    tasks: list[BatchTask],
+    *,
+    overwrite: bool,
+    retry_attempts: int,
+    max_workers: int,
+    progress_callback: Callable[[int, int, BatchResult], None] | None = None,
+) -> BatchConversionOutcome:
+    if not tasks:
+        raise FileNotFoundError("No supported files are available for batch conversion.")
+
+    start_time = time.perf_counter()
+    progress_tracker = ProgressTracker(len(tasks), progress_callback)
+    cleanup_warnings: list[str] = []
+    session_restarts = 0
+    indexed_results: list[tuple[int, BatchResult]] = []
+    chunks = _split_tasks_for_parallelism(tasks, max_workers)
+    parallel_workers_used = min(max_workers, len(chunks))
+
+    if parallel_workers_used == 1:
+        chunk_tasks, chunk_results, chunk_warnings, chunk_restarts = _process_task_chunk(
+            chunks[0],
+            overwrite=overwrite,
+            retry_attempts=retry_attempts,
+            progress_tracker=progress_tracker,
+        )
+        cleanup_warnings.extend(chunk_warnings)
+        session_restarts += chunk_restarts
+        indexed_results.extend(
+            (task.index, result) for task, result in zip(chunk_tasks, chunk_results)
+        )
+    else:
+        with ThreadPoolExecutor(
+            max_workers=parallel_workers_used,
+            thread_name_prefix="office-batch",
+        ) as executor:
+            futures: list[Future[tuple[list[BatchTask], list[BatchResult], list[str], int]]] = [
+                executor.submit(
+                    _process_task_chunk,
+                    chunk,
+                    overwrite=overwrite,
+                    retry_attempts=retry_attempts,
+                    progress_tracker=progress_tracker,
+                )
+                for chunk in chunks
+            ]
+            for future in as_completed(futures):
+                chunk_tasks, chunk_results, chunk_warnings, chunk_restarts = future.result()
+                cleanup_warnings.extend(chunk_warnings)
+                session_restarts += chunk_restarts
+                indexed_results.extend(
+                    (task.index, result)
+                    for task, result in zip(chunk_tasks, chunk_results)
+                )
+
+    results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+    warning = None
+    if cleanup_warnings:
+        warning = (
+            "Batch finished, but Office cleanup reported warnings. "
+            f"{' '.join(cleanup_warnings)}"
+        )
+
+    duration_seconds = time.perf_counter() - start_time
+    return BatchConversionOutcome(
+        results=results,
+        warning=warning,
+        duration_seconds=duration_seconds,
+        reused_single_session=(parallel_workers_used == 1 and session_restarts == 0),
+        session_restarts=session_restarts,
+        parallel_workers_used=parallel_workers_used,
+    )
+
 
 def convert_directory_to_pdf(
     input_dir: Path,
@@ -705,6 +942,8 @@ def convert_directory_to_pdf(
     *,
     recursive: bool = False,
     overwrite: bool = False,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    max_workers: int = DEFAULT_BATCH_WORKERS,
     progress_callback: Callable[[int, int, BatchResult], None] | None = None,
 ) -> BatchConversionOutcome:
     if not input_dir.is_dir():
@@ -716,114 +955,16 @@ def convert_directory_to_pdf(
             f"No supported files found in directory: {input_dir} ({supported_input_label()})"
         )
 
-    results: list[BatchResult] = []
-    total = len(files)
-    cleanup_warnings: list[str] = []
-    session_restarts = 0
-    consecutive_failures = 0
-    start_time = time.perf_counter()
-
-    session = None
-    session_kind: str | None = None
-    try:
-        for index, source in enumerate(files, start=1):
-            kind = detect_input_kind(source)
-            if kind is None:
-                result = BatchResult(
-                    source=source,
-                    target=build_batch_target(source, input_dir, output_dir),
-                    success=False,
-                    message=(
-                        f"Unsupported input format: {source.suffix}. "
-                        f"Supported: {supported_input_label()}"
-                    ),
-                )
-                results.append(result)
-                if progress_callback is not None:
-                    progress_callback(index, total, result)
-                consecutive_failures += 1
-                continue
-
-            if session is None or session_kind != kind:
-                if session is not None:
-                    session.__exit__(None, None, None)
-                    _drain_session_warnings(session, cleanup_warnings)
-                session = _open_session_for_kind(kind)
-                session_kind = kind
-                consecutive_failures = 0
-
-            target = build_batch_target(source, input_dir, output_dir)
-            try:
-                outcome = session.convert_file(source, target, overwrite=overwrite)
-                result = BatchResult(
-                    source=source,
-                    target=target,
-                    success=True,
-                    message=outcome.warning or "Converted successfully.",
-                )
-                consecutive_failures = 0
-            except Exception as exc:
-                result = BatchResult(
-                    source=source,
-                    target=target,
-                    success=False,
-                    message=str(exc),
-                )
-                consecutive_failures += 1
-
-            results.append(result)
-            if progress_callback is not None:
-                progress_callback(index, total, result)
-
-            if (
-                consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD
-                and index < total
-                and session is not None
-            ):
-                previous_pid = _extract_session_pid(session)
-                session.__exit__(None, None, None)
-                _drain_session_warnings(session, cleanup_warnings)
-                session_restarts += 1
-                consecutive_failures = 0
-
-                try:
-                    session = _open_session_for_kind(session_kind or "word")
-                    restart_message = (
-                        f"{session_kind.capitalize() if session_kind else 'Office'} session restarted after consecutive failures to isolate subsequent files."
-                    )
-                    if previous_pid is not None:
-                        restart_message = f"{restart_message} Previous PID: {previous_pid}."
-                    info_result = BatchResult(
-                        source=source,
-                        target=target,
-                        success=True,
-                        message=restart_message,
-                    )
-                    if progress_callback is not None:
-                        progress_callback(index, total, info_result)
-                except Exception as restart_exc:
-                    raise WordConversionError(
-                        f"Unable to restart {session_kind or 'office'} session after consecutive failures: {restart_exc}"
-                    ) from restart_exc
-    finally:
-        if session is not None:
-            session.__exit__(None, None, None)
-            _drain_session_warnings(session, cleanup_warnings)
-
-    cleanup_warning = None
-    if cleanup_warnings:
-        cleanup_warning = (
-            "Batch finished, but Word cleanup reported warnings. "
-            f"{' '.join(cleanup_warnings)}"
-        )
-
-    duration_seconds = time.perf_counter() - start_time
-    return BatchConversionOutcome(
-        results=results,
-        warning=cleanup_warning,
-        duration_seconds=duration_seconds,
-        reused_single_session=(session_restarts == 0),
-        session_restarts=session_restarts,
+    tasks = _build_batch_tasks(
+        files,
+        lambda source: build_batch_target(source, input_dir, output_dir),
+    )
+    return _run_batch_tasks(
+        tasks,
+        overwrite=overwrite,
+        retry_attempts=retry_attempts,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
     )
 
 
@@ -832,125 +973,24 @@ def convert_file_list_to_pdf(
     output_dir: Path | None = None,
     *,
     overwrite: bool = False,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    max_workers: int = DEFAULT_BATCH_WORKERS,
     progress_callback: Callable[[int, int, BatchResult], None] | None = None,
 ) -> BatchConversionOutcome:
     if not sources:
         raise FileNotFoundError("No files were provided for batch conversion.")
 
-    files = [path.resolve() for path in sources if is_supported_input_file(path.resolve())]
-    if not files:
-        raise FileNotFoundError(
-            f"No valid supported files were provided for batch conversion ({supported_input_label()})."
-        )
-
-    results: list[BatchResult] = []
-    cleanup_warnings: list[str] = []
-    session_restarts = 0
-    consecutive_failures = 0
-    total = len(files)
-    start_time = time.perf_counter()
-
-    session = None
-    session_kind: str | None = None
-    try:
-        for index, source in enumerate(files, start=1):
-            kind = detect_input_kind(source)
-            if kind is None:
-                result = BatchResult(
-                    source=source,
-                    target=build_list_target(source, output_dir),
-                    success=False,
-                    message=(
-                        f"Unsupported input format: {source.suffix}. "
-                        f"Supported: {supported_input_label()}"
-                    ),
-                )
-                results.append(result)
-                if progress_callback is not None:
-                    progress_callback(index, total, result)
-                consecutive_failures += 1
-                continue
-
-            if session is None or session_kind != kind:
-                if session is not None:
-                    session.__exit__(None, None, None)
-                    _drain_session_warnings(session, cleanup_warnings)
-                session = _open_session_for_kind(kind)
-                session_kind = kind
-                consecutive_failures = 0
-
-            target = build_list_target(source, output_dir)
-            try:
-                outcome = session.convert_file(source, target, overwrite=overwrite)
-                result = BatchResult(
-                    source=source,
-                    target=target,
-                    success=True,
-                    message=outcome.warning or "Converted successfully.",
-                )
-                consecutive_failures = 0
-            except Exception as exc:
-                result = BatchResult(
-                    source=source,
-                    target=target,
-                    success=False,
-                    message=str(exc),
-                )
-                consecutive_failures += 1
-
-            results.append(result)
-            if progress_callback is not None:
-                progress_callback(index, total, result)
-
-            if (
-                consecutive_failures >= BATCH_SESSION_RESTART_FAILURE_THRESHOLD
-                and index < total
-                and session is not None
-            ):
-                previous_pid = _extract_session_pid(session)
-                session.__exit__(None, None, None)
-                _drain_session_warnings(session, cleanup_warnings)
-                session_restarts += 1
-                consecutive_failures = 0
-
-                try:
-                    session = _open_session_for_kind(session_kind or "word")
-                    restart_message = (
-                        f"{session_kind.capitalize() if session_kind else 'Office'} session restarted after consecutive failures to isolate subsequent files."
-                    )
-                    if previous_pid is not None:
-                        restart_message = f"{restart_message} Previous PID: {previous_pid}."
-                    info_result = BatchResult(
-                        source=source,
-                        target=target,
-                        success=True,
-                        message=restart_message,
-                    )
-                    if progress_callback is not None:
-                        progress_callback(index, total, info_result)
-                except Exception as restart_exc:
-                    raise WordConversionError(
-                        f"Unable to restart {session_kind or 'office'} session after consecutive failures: {restart_exc}"
-                    ) from restart_exc
-    finally:
-        if session is not None:
-            session.__exit__(None, None, None)
-            _drain_session_warnings(session, cleanup_warnings)
-
-    cleanup_warning = None
-    if cleanup_warnings:
-        cleanup_warning = (
-            "Batch finished, but Word cleanup reported warnings. "
-            f"{' '.join(cleanup_warnings)}"
-        )
-
-    duration_seconds = time.perf_counter() - start_time
-    return BatchConversionOutcome(
-        results=results,
-        warning=cleanup_warning,
-        duration_seconds=duration_seconds,
-        reused_single_session=(session_restarts == 0),
-        session_restarts=session_restarts,
+    files = _normalize_supported_sources(sources)
+    tasks = _build_batch_tasks(
+        files,
+        lambda source: build_list_target(source, output_dir),
+    )
+    return _run_batch_tasks(
+        tasks,
+        overwrite=overwrite,
+        retry_attempts=retry_attempts,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
     )
 
 
@@ -968,7 +1008,11 @@ def run_cli(args: argparse.Namespace) -> int:
 
     if source.is_file():
         file_source, target = resolve_file_paths(args.input_path, args.output_path)
-        outcome = convert_word_to_pdf(file_source, target, overwrite=args.overwrite)
+        outcome = convert_supported_file_to_pdf(
+            file_source,
+            target,
+            overwrite=args.overwrite,
+        )
         print(f"Converted successfully: {outcome.target}")
         if outcome.warning:
             print(f"Warning: {outcome.warning}", file=sys.stderr)
@@ -983,6 +1027,8 @@ def run_cli(args: argparse.Namespace) -> int:
             output_dir,
             recursive=args.recursive,
             overwrite=args.overwrite,
+            retry_attempts=max(0, args.retry_attempts),
+            max_workers=max(1, args.workers),
         )
         for result in batch_outcome.results:
             status = "OK" if result.success else "FAILED"
@@ -993,11 +1039,18 @@ def run_cli(args: argparse.Namespace) -> int:
                 print(f"        {result.message}")
 
         print(format_batch_summary(batch_outcome.results))
-        session_note = (
-            "Batch used a single reusable Word session."
-            if batch_outcome.reused_single_session
-            else f"Batch reused Word sessions with {batch_outcome.session_restarts} automatic restart(s)."
-        )
+        if batch_outcome.parallel_workers_used > 1:
+            session_note = (
+                f"Batch used {batch_outcome.parallel_workers_used} parallel Office worker(s) "
+                f"with {batch_outcome.session_restarts} session restart(s)."
+            )
+        elif batch_outcome.reused_single_session:
+            session_note = "Batch used a single reusable Office session."
+        else:
+            session_note = (
+                "Batch reused Office sessions with "
+                f"{batch_outcome.session_restarts} automatic restart(s)."
+            )
         print(f"Info: {session_note}")
         print(f"Info: Batch duration: {_format_duration(batch_outcome.duration_seconds)}")
         if batch_outcome.warning:
@@ -1009,18 +1062,22 @@ def run_cli(args: argparse.Namespace) -> int:
 
 class WordToPdfApp:
     def __init__(self) -> None:
+        self.config = load_app_config()
         self.root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
-        self.root.title("Word to PDF Converter")
-        self.root.geometry("1220x820")
-        self.root.minsize(1080, 740)
+        self.root.title("Office to PDF Converter")
+        self.root.geometry("1380x920")
+        self.root.minsize(1240, 860)
         self.root.configure(bg="#eef3f1")
 
-        self.mode_var = tk.StringVar(value="file")
-        self.input_var = tk.StringVar()
-        self.output_var = tk.StringVar()
-        self.recursive_var = tk.BooleanVar(value=False)
-        self.overwrite_var = tk.BooleanVar(value=False)
-        self.failures_only_var = tk.BooleanVar(value=False)
+        self.mode_var = tk.StringVar(value=self.config.mode)
+        self.input_var = tk.StringVar(value=self.config.last_input)
+        self.output_var = tk.StringVar(value=self.config.last_output)
+        self.recursive_var = tk.BooleanVar(value=self.config.recursive)
+        self.overwrite_var = tk.BooleanVar(value=self.config.overwrite)
+        self.failures_only_var = tk.BooleanVar(value=self.config.failures_only)
+        self.retry_attempts_var = tk.IntVar(value=self.config.retry_attempts)
+        self.batch_workers_var = tk.IntVar(value=self.config.batch_workers)
+        self.watch_enabled_var = tk.BooleanVar(value=self.config.watch_enabled)
         self.drop_hint_var = tk.StringVar(
             value=(
                 "Drag a Word/Excel/PowerPoint file or folder onto the window. "
@@ -1030,16 +1087,28 @@ class WordToPdfApp:
             )
         )
         self.status_var = tk.StringVar(
-            value="Ready. Select a Word file or a directory to begin."
+            value="Ready. Select an Office file or a directory to begin."
         )
         self.summary_var = tk.StringVar(value="No results yet.")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.preview_title_var = tk.StringVar(
+            value="Select a result row to inspect source and output details."
+        )
+        self.preview_source_var = tk.StringVar(value="-")
+        self.preview_output_var = tk.StringVar(value="-")
+        self.preview_details_var = tk.StringVar(value="-")
         self.worker_thread: threading.Thread | None = None
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.result_rows: list[dict[str, str]] = []
         self.sort_column = "status"
         self.sort_descending = False
+        self._results_refresh_job: str | None = None
+        self._results_should_scroll_end = False
+        self._results_prefer_last_selection = True
+        self._pending_selection_key: tuple[str, str, str] | None = None
         self.dropped_files: list[Path] = []
+        self._auto_output_path: Path | None = None
+        self.watch_snapshot: dict[Path, tuple[int, int]] = {}
         self.drop_hint_default_bg = "#f6f8fb"
         self.drop_hint_active_bg = "#e7f0fb"
         self.drop_hint_default_border = self.colors["border"] if hasattr(self, "colors") else "#d8dee6"
@@ -1049,7 +1118,14 @@ class WordToPdfApp:
         self._build_context_menu()
         self._register_drop_targets()
         self._toggle_mode()
-        self.root.after(150, self._poll_events)
+        self._sync_output_with_input(force=False)
+        self._update_preview_panel(None)
+        self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
+        self.root.after(80, self._poll_events)
+        self.root.after(
+            int(max(1.0, self.config.watch_interval_seconds) * 1000),
+            self._poll_folder_watch,
+        )
 
     def _apply_styles(self) -> None:
         style = ttk.Style()
@@ -1226,14 +1302,14 @@ class WordToPdfApp:
         hero_top.pack(fill="x")
         tk.Label(
             hero_top,
-            text="Word to PDF Converter",
+            text="Office to PDF Converter",
             font=("Segoe UI Semibold", 22),
             fg=self.colors["text"],
             bg=self.colors["hero"],
         ).pack(anchor="w")
         tk.Label(
             hero_top,
-            text="A desktop utility for reliable Word-to-PDF conversion in office workflows.",
+            text="A desktop utility for reliable Office-to-PDF conversion in office workflows.",
             font=("Segoe UI", 10),
             fg=self.colors["muted"],
             bg=self.colors["hero"],
@@ -1243,7 +1319,7 @@ class WordToPdfApp:
         meta_row.pack(anchor="w", pady=(14, 0))
         tk.Label(
             meta_row,
-            text="Windows + Microsoft Word required",
+            text="Windows + Microsoft Office required",
             font=("Segoe UI", 9),
             fg=self.colors["muted"],
             bg=self.colors["hero"],
@@ -1299,8 +1375,8 @@ class WordToPdfApp:
 
         body = ttk.Frame(container, style="App.TFrame")
         body.pack(fill="both", expand=True, pady=(22, 0))
-        body.columnconfigure(0, weight=5, minsize=440)
-        body.columnconfigure(1, weight=7, minsize=700)
+        body.columnconfigure(0, weight=6, minsize=520)
+        body.columnconfigure(1, weight=8, minsize=780)
         body.rowconfigure(1, weight=1)
 
         self.left_column = ttk.Frame(body, style="App.TFrame")
@@ -1310,7 +1386,7 @@ class WordToPdfApp:
         self.right_column = ttk.Frame(body, style="App.TFrame")
         self.right_column.grid(row=0, column=1, rowspan=2, sticky="nsew")
         self.right_column.columnconfigure(0, weight=1)
-        self.right_column.rowconfigure(1, weight=1)
+        self.right_column.rowconfigure(2, weight=1)
 
         mode_frame = ttk.LabelFrame(self.left_column, text="Mode", padding=20, style="Card.TLabelframe")
         mode_frame.pack(fill="x")
@@ -1336,19 +1412,21 @@ class WordToPdfApp:
 
         mode_hint = ttk.Label(
             mode_frame,
-            text="Use batch mode when you want to convert every Word file inside a folder.",
+            text="Use batch mode to convert every supported Office file inside a folder.",
             style="Muted.TLabel",
         )
-        mode_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        mode_hint.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        mode_hint.configure(wraplength=420, justify="left")
 
         path_frame = ttk.LabelFrame(self.left_column, text="Paths", padding=20, style="Card.TLabelframe")
         path_frame.pack(fill="x", pady=(16, 0))
         path_frame.columnconfigure(1, weight=1)
+        path_frame.columnconfigure(2, minsize=126)
 
         ttk.Label(path_frame, text="Input", style="Body.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        self.input_entry = ttk.Entry(path_frame, textvariable=self.input_var, width=36)
+        self.input_entry = ttk.Entry(path_frame, textvariable=self.input_var, width=44)
         self.input_entry.grid(row=0, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
         ttk.Button(
             path_frame,
@@ -1361,7 +1439,7 @@ class WordToPdfApp:
 
         self.output_label = ttk.Label(path_frame, text="Output", style="Body.TLabel")
         self.output_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
-        self.output_entry = ttk.Entry(path_frame, textvariable=self.output_var, width=36)
+        self.output_entry = ttk.Entry(path_frame, textvariable=self.output_var, width=44)
         self.output_entry.grid(row=1, column=1, sticky="ew", padx=(12, 10), pady=(0, 8))
         ttk.Button(
             path_frame,
@@ -1376,7 +1454,8 @@ class WordToPdfApp:
             path_frame,
             text="Leave output empty to export beside the source file or folder.",
             style="Muted.TLabel",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        path_frame.grid_slaves(row=2, column=0)[0].configure(wraplength=420, justify="left")
 
         self.pending_frame = ttk.LabelFrame(
             self.left_column,
@@ -1468,7 +1547,9 @@ class WordToPdfApp:
         options_frame = ttk.LabelFrame(self.left_column, text="Options", padding=20, style="Card.TLabelframe")
         options_frame.pack(fill="x", pady=(16, 0))
         options_frame.columnconfigure(0, weight=1)
-        options_frame.columnconfigure(1, weight=1)
+        options_frame.columnconfigure(1, weight=0, minsize=92)
+        options_frame.columnconfigure(2, weight=1)
+        options_frame.columnconfigure(3, weight=0, minsize=92)
 
         self.recursive_check = ttk.Checkbutton(
             options_frame,
@@ -1477,12 +1558,51 @@ class WordToPdfApp:
             style="App.TCheckbutton",
         )
         self.recursive_check.grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
+        self.overwrite_check = ttk.Checkbutton(
             options_frame,
             text="Overwrite existing PDF files",
             variable=self.overwrite_var,
             style="App.TCheckbutton",
-        ).grid(row=0, column=1, sticky="w", padx=(22, 0))
+        )
+        self.overwrite_check.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.watch_checkbox = ttk.Checkbutton(
+            options_frame,
+            text="Watch input folder",
+            variable=self.watch_enabled_var,
+            style="App.TCheckbutton",
+        )
+        self.watch_checkbox.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        ttk.Label(options_frame, text="Retry attempts", style="Body.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(16, 6)
+        )
+        self.retry_spinbox = ttk.Spinbox(
+            options_frame,
+            from_=0,
+            to=5,
+            textvariable=self.retry_attempts_var,
+            width=6,
+        )
+        self.retry_spinbox.grid(row=3, column=1, sticky="w", pady=(16, 6), padx=(18, 0))
+
+        ttk.Label(options_frame, text="Batch workers", style="Body.TLabel").grid(
+            row=3, column=2, sticky="w", pady=(16, 6), padx=(18, 0)
+        )
+        self.workers_spinbox = ttk.Spinbox(
+            options_frame,
+            from_=1,
+            to=4,
+            textvariable=self.batch_workers_var,
+            width=6,
+        )
+        self.workers_spinbox.grid(row=3, column=3, sticky="w", pady=(16, 6), padx=(12, 0))
+
+        ttk.Label(
+            options_frame,
+            text="Retries rebuild the Office session. Parallel workers can improve large-batch throughput.",
+            style="Muted.TLabel",
+        ).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        options_frame.grid_slaves(row=4, column=0)[0].configure(wraplength=430, justify="left")
 
         action_frame = ttk.Frame(self.left_column, padding=(0, 18, 0, 0), style="App.TFrame")
         action_frame.pack(fill="x")
@@ -1551,12 +1671,86 @@ class WordToPdfApp:
             font=("Segoe UI", 9),
             fg=self.colors["muted"],
             bg=self.colors["card"],
-            wraplength=430,
+            wraplength=620,
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
+        preview_frame = ttk.LabelFrame(
+            self.right_column,
+            text="Preview",
+            padding=20,
+            style="Card.TLabelframe",
+        )
+        preview_frame.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        preview_frame.columnconfigure(0, weight=0, minsize=72)
+        preview_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            preview_frame,
+            textvariable=self.preview_title_var,
+            style="Body.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(preview_frame, text="Source", style="Body.TLabel").grid(
+            row=1, column=0, sticky="nw", pady=(12, 0)
+        )
+        ttk.Label(
+            preview_frame,
+            textvariable=self.preview_source_var,
+            style="Muted.TLabel",
+            wraplength=700,
+            justify="left",
+        ).grid(row=1, column=1, sticky="w", pady=(12, 0))
+        ttk.Label(preview_frame, text="Output", style="Body.TLabel").grid(
+            row=2, column=0, sticky="nw", pady=(10, 0)
+        )
+        ttk.Label(
+            preview_frame,
+            textvariable=self.preview_output_var,
+            style="Muted.TLabel",
+            wraplength=700,
+            justify="left",
+        ).grid(row=2, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(preview_frame, text="Details", style="Body.TLabel").grid(
+            row=3, column=0, sticky="nw", pady=(10, 0)
+        )
+        ttk.Label(
+            preview_frame,
+            textvariable=self.preview_details_var,
+            style="Muted.TLabel",
+            wraplength=700,
+            justify="left",
+        ).grid(row=3, column=1, sticky="w", pady=(10, 0))
+
+        preview_actions = ttk.Frame(preview_frame, style="Card.TFrame")
+        preview_actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        preview_actions.columnconfigure(0, weight=1)
+        preview_actions.columnconfigure(1, weight=1)
+        preview_actions.columnconfigure(2, weight=1)
+
+        self.open_source_button = ttk.Button(
+            preview_actions,
+            text="Open Source",
+            command=self._open_selected_source,
+            style="Secondary.TButton",
+        )
+        self.open_source_button.grid(row=0, column=0, sticky="ew")
+        self.open_output_button = ttk.Button(
+            preview_actions,
+            text="Open Output",
+            command=self._open_selected_output_file,
+            style="Secondary.TButton",
+        )
+        self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(12, 12))
+        self.open_folder_button = ttk.Button(
+            preview_actions,
+            text="Open Output Folder",
+            command=self._open_selected_output_folder,
+            style="Secondary.TButton",
+        )
+        self.open_folder_button.grid(row=0, column=2, sticky="ew")
+
         log_frame = ttk.LabelFrame(self.right_column, text="Results", padding=20, style="Card.TLabelframe")
-        log_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        log_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -1597,15 +1791,16 @@ class WordToPdfApp:
         self.results_table.heading(
             "details", text="Details", command=lambda: self._sort_results_by("details")
         )
-        self.results_table.column("status", width=120, minwidth=105, anchor="center", stretch=False)
-        self.results_table.column("source", width=220, minwidth=180, anchor="w")
-        self.results_table.column("output", width=220, minwidth=180, anchor="w")
-        self.results_table.column("details", width=280, minwidth=220, anchor="w")
+        self.results_table.column("status", width=130, minwidth=110, anchor="center", stretch=False)
+        self.results_table.column("source", width=250, minwidth=220, anchor="w")
+        self.results_table.column("output", width=250, minwidth=220, anchor="w")
+        self.results_table.column("details", width=360, minwidth=280, anchor="w")
         self.results_table.grid(row=1, column=0, sticky="nsew")
         self.results_table.tag_configure("ok", background="#edf7f2", foreground="#1d5d43")
         self.results_table.tag_configure("failed", background="#fbefef", foreground="#8a2f2f")
         self.results_table.tag_configure("error", background="#fff4e8", foreground="#8c4b1f")
         self.results_table.tag_configure("info", background="#f6f8fb", foreground=self.colors["text"])
+        self.results_table.bind("<<TreeviewSelect>>", self._handle_result_selection)
         self.results_table.bind("<Double-1>", self._handle_row_double_click)
         self.results_table.bind("<Button-3>", self._show_context_menu)
 
@@ -1681,6 +1876,43 @@ class WordToPdfApp:
         messagebox.showerror("Unsupported Drop", message)
         return "break"
 
+    def _current_output_path(self) -> Path | None:
+        output_text = self.output_var.get().strip()
+        if not output_text:
+            return None
+        try:
+            return Path(output_text).expanduser().resolve()
+        except OSError:
+            return None
+
+    def _sync_output_with_input(self, force: bool = False) -> None:
+        if self.mode_var.get() != "file" or self.dropped_files:
+            return
+
+        input_text = self.input_var.get().strip()
+        if not input_text:
+            if force:
+                self.output_var.set("")
+                self._auto_output_path = None
+            return
+
+        source = Path(input_text).expanduser()
+        if source.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+            return
+
+        suggested_output = source.with_suffix(".pdf").resolve()
+        current_output = self._current_output_path()
+        should_replace = (
+            force
+            or current_output is None
+            or (self._auto_output_path is not None and current_output == self._auto_output_path)
+        )
+        if should_replace:
+            self.output_var.set(str(suggested_output))
+            self._auto_output_path = suggested_output
+        elif current_output is not None:
+            self._auto_output_path = None
+
     def _clear_dropped_files(self) -> None:
         self.dropped_files = []
         self._refresh_pending_file_list()
@@ -1693,6 +1925,7 @@ class WordToPdfApp:
         if self.mode_var.get() == "directory" and not self.input_var.get().strip():
             self.mode_var.set("file")
             self._toggle_mode()
+        self._persist_config()
 
     def _refresh_pending_file_list(self) -> None:
         self.pending_listbox.delete(0, "end")
@@ -1726,10 +1959,9 @@ class WordToPdfApp:
             self.dropped_files = []
             self.mode_var.set("file")
             self.input_var.set(str(remaining))
-            if not self.output_var.get().strip():
-                self.output_var.set(str(remaining.with_suffix(".pdf")))
+            self._sync_output_with_input(force=True)
             self.drop_hint_var.set(
-                "Single-file mode is ready. Drag another Word file here to replace it."
+                "Single-file mode is ready. Drag another Office file here to replace it."
             )
             self.status_var.set(f"Kept one file and switched to single-file mode: {remaining.name}")
             self._toggle_mode()
@@ -1745,10 +1977,12 @@ class WordToPdfApp:
         self.status_var.set(
             f"Removed selected files. {len(self.dropped_files)} dropped files remain."
         )
+        self._persist_config()
 
     def _set_batch_file_drop(self, files: list[Path]) -> None:
         self.dropped_files = files
         self.mode_var.set("directory")
+        self._auto_output_path = None
         self._toggle_mode()
         first_parent = files[0].parent
         if not self.output_var.get().strip():
@@ -1761,6 +1995,7 @@ class WordToPdfApp:
             f"Prepared a dropped-file batch with {len(files)} files."
         )
         self._handle_drop_leave(None)
+        self._persist_config()
 
     def _handle_input_drop(self, event: object) -> str:
         data = getattr(event, "data", "")
@@ -1775,12 +2010,15 @@ class WordToPdfApp:
             self._refresh_pending_file_list()
             self.mode_var.set("directory")
             self.input_var.set(str(path))
+            self._auto_output_path = None
             self._toggle_mode()
             self.drop_hint_var.set(
                 "Directory batch mode is ready. Drag a folder here anytime to replace it."
             )
             self.status_var.set(f"Input directory selected by drag and drop: {path}")
             self._handle_drop_leave(event)
+            self._update_preview_panel(None)
+            self._persist_config()
             return "break"
 
         supported_files = [path for path in paths if is_supported_input_file(path)]
@@ -1810,13 +2048,14 @@ class WordToPdfApp:
             self.mode_var.set("file")
             self.input_var.set(str(path))
             self._toggle_mode()
-            if not self.output_var.get().strip():
-                self.output_var.set(str(path.with_suffix(".pdf")))
+            self._sync_output_with_input(force=True)
             self.drop_hint_var.set(
-                "Single-file mode is ready. Drag another Word file here to replace it."
+                "Single-file mode is ready. Drag another Office file here to replace it."
             )
             self.status_var.set(f"Input file selected by drag and drop: {path.name}")
             self._handle_drop_leave(event)
+            self._update_preview_panel(None)
+            self._persist_config()
             return "break"
 
         return self._show_drop_error(
@@ -1835,12 +2074,16 @@ class WordToPdfApp:
             self.output_var.set(str(path))
             self.status_var.set(f"Output directory selected by drag and drop: {path}")
             self._handle_drop_leave(event)
+            self._update_preview_panel(None)
+            self._persist_config()
             return "break"
 
         if path.suffix.lower() == ".pdf":
             self.output_var.set(str(path))
             self.status_var.set(f"Output PDF selected by drag and drop: {path.name}")
             self._handle_drop_leave(event)
+            self._update_preview_panel(None)
+            self._persist_config()
             return "break"
 
         return self._show_drop_error(
@@ -1853,10 +2096,17 @@ class WordToPdfApp:
             text="Output directory" if directory_mode else "Output PDF"
         )
         if directory_mode:
+            self._auto_output_path = None
             self.recursive_check.state(["!disabled"])
+            self.watch_checkbox.state(["!disabled"])
         else:
             self.recursive_var.set(False)
             self.recursive_check.state(["disabled"])
+            self.watch_enabled_var.set(False)
+            self.watch_checkbox.state(["disabled"])
+            self.watch_snapshot = {}
+            self._sync_output_with_input(force=False)
+        self._update_preview_panel(None)
 
     def _browse_input(self) -> None:
         if self.mode_var.get() == "directory":
@@ -1875,6 +2125,9 @@ class WordToPdfApp:
         if selected:
             self._clear_dropped_files()
             self.input_var.set(selected)
+            self._sync_output_with_input(force=True)
+            self._update_preview_panel(None)
+            self._persist_config()
 
     def _browse_output(self) -> None:
         if self.mode_var.get() == "directory":
@@ -1887,6 +2140,9 @@ class WordToPdfApp:
             )
         if selected:
             self.output_var.set(selected)
+            self._auto_output_path = None
+            self._update_preview_panel(None)
+            self._persist_config()
 
     def _append_result(
         self,
@@ -1894,7 +2150,13 @@ class WordToPdfApp:
         source: str,
         output: str,
         details: str,
+        *,
+        prefer_selection: bool = True,
     ) -> None:
+        log_level = logging.WARNING if status.upper() in {"FAILED", "ERROR"} else logging.INFO
+        LOGGER.log(log_level, "%s | %s -> %s | %s", status, source, output, details)
+        if prefer_selection and source != "-" and output != "-":
+            self._pending_selection_key = (source, output, details)
         self.result_rows.append(
             {
                 "status": status,
@@ -1903,11 +2165,16 @@ class WordToPdfApp:
                 "details": details,
             }
         )
-        self._refresh_results_table(scroll_to_end=True)
+        self._schedule_results_refresh(
+            scroll_to_end=True,
+            prefer_last_selection=prefer_selection,
+        )
 
     def _clear_log(self) -> None:
         self.result_rows.clear()
+        self._pending_selection_key = None
         self._refresh_results_table()
+        self._update_preview_panel(None)
 
     def _status_tag(self, status: str) -> str:
         return {
@@ -1916,14 +2183,6 @@ class WordToPdfApp:
             "ERROR": "error",
             "INFO": "info",
         }.get(status.upper(), "info")
-
-    def _status_symbol(self, status: str) -> str:
-        return {
-            "OK": "✓ Success",
-            "FAILED": "✗ Failed",
-            "ERROR": "! Error",
-            "INFO": "• Info",
-        }.get(status.upper(), status)
 
     def _sort_value(self, row: dict[str, str], column: str) -> tuple[int, str]:
         status_rank = {
@@ -1955,23 +2214,39 @@ class WordToPdfApp:
             f"Showing {shown} of {total} items  |  Failures: {failed}"
         )
 
-    def _refresh_heading_labels(self) -> None:
-        labels = {
-            "status": "Status",
-            "source": "Source",
-            "output": "Output",
-            "details": "Details",
-        }
-        arrow = " ↓" if self.sort_descending else " ↑"
-        for column, label in labels.items():
-            heading = label + arrow if column == self.sort_column else label
-            self.results_table.heading(
-                column,
-                text=heading,
-                command=lambda col=column: self._sort_results_by(col),
-            )
+    def _schedule_results_refresh(
+        self,
+        *,
+        scroll_to_end: bool = False,
+        prefer_last_selection: bool = True,
+    ) -> None:
+        self._results_should_scroll_end = self._results_should_scroll_end or scroll_to_end
+        self._results_prefer_last_selection = (
+            self._results_prefer_last_selection and prefer_last_selection
+        )
+        if self._results_refresh_job is None:
+            self._results_refresh_job = self.root.after_idle(self._flush_results_refresh)
 
-    def _refresh_results_table(self, scroll_to_end: bool = False) -> None:
+    def _flush_results_refresh(self) -> None:
+        self._results_refresh_job = None
+        scroll_to_end = self._results_should_scroll_end
+        prefer_last_selection = self._results_prefer_last_selection
+        self._results_should_scroll_end = False
+        self._results_prefer_last_selection = True
+        self._refresh_results_table(
+            scroll_to_end=scroll_to_end,
+            prefer_last_selection=prefer_last_selection,
+        )
+
+    def _refresh_results_table(
+        self,
+        scroll_to_end: bool = False,
+        prefer_last_selection: bool = True,
+    ) -> None:
+        current_values = self._selected_row_values()
+        selection_key = self._pending_selection_key
+        if selection_key is None and current_values is not None:
+            selection_key = (current_values[1], current_values[2], current_values[3])
         for item in self.results_table.get_children():
             self.results_table.delete(item)
 
@@ -1996,11 +2271,24 @@ class WordToPdfApp:
             )
             last_item_id = item_id
 
+            if selection_key is not None and (
+                row["source"],
+                row["output"],
+                row["details"],
+            ) == selection_key:
+                self.results_table.selection_set(item_id)
+                self.results_table.focus(item_id)
+
         if scroll_to_end and last_item_id is not None:
             self.results_table.see(last_item_id)
+            if prefer_last_selection and not self.results_table.selection():
+                self.results_table.selection_set(last_item_id)
+                self.results_table.focus(last_item_id)
 
         self._refresh_heading_labels()
         self._update_summary_text(rows)
+        self._update_preview_panel(self._selected_row_values())
+        self._pending_selection_key = None
 
     def _sort_results_by(self, column: str) -> None:
         if self.sort_column == column:
@@ -2016,22 +2304,6 @@ class WordToPdfApp:
             return selection[0]
         focused = self.results_table.focus()
         return focused or None
-
-    def _selected_row_values(self) -> tuple[str, str, str, str] | None:
-        item_id = self._selected_item_id()
-        if not item_id:
-            return None
-        values = self.results_table.item(item_id, "values")
-        if len(values) != 4:
-            return None
-        status, source, output, details = (str(value) for value in values)
-        status = (
-            status.replace("✓ ", "")
-            .replace("✗ ", "")
-            .replace("! ", "")
-            .replace("• ", "")
-        )
-        return status, source, output, details
 
     def _copy_text(self, text: str, success_message: str) -> None:
         if not text or text == "-":
@@ -2058,14 +2330,14 @@ class WordToPdfApp:
         self._copy_text(text, success_message)
 
     def _open_selected_output_folder(self) -> None:
-        values = self._selected_row_values()
+        values = self._effective_preview_values()
         if values is None:
-            self.status_var.set("Select a result row first.")
+            self.status_var.set("Select a result row or choose an output path first.")
             return
 
         _, _, output, _ = values
         if not output or output == "-":
-            self.status_var.set("No output path is available for the selected row.")
+            self.status_var.set("No output path is available right now.")
             return
 
         output_path = Path(output)
@@ -2132,9 +2404,18 @@ class WordToPdfApp:
             messagebox.showerror("Missing Input", "Please select an input file or directory.")
             return
 
+        self.retry_attempts_var.set(max(0, self.retry_attempts_var.get()))
+        self.batch_workers_var.set(max(1, self.batch_workers_var.get()))
+        self._persist_config()
         self.progress_var.set(0)
         self.status_var.set("Starting conversion...")
-        self._append_result("INFO", "-", "-", "Starting conversion task.")
+        self._append_result(
+            "INFO",
+            "-",
+            "-",
+            "Starting conversion task.",
+            prefer_selection=False,
+        )
         self._set_running_state(True)
 
         self.worker_thread = threading.Thread(
@@ -2166,6 +2447,8 @@ class WordToPdfApp:
                     self.dropped_files,
                     output_dir,
                     overwrite=self.overwrite_var.get(),
+                    retry_attempts=max(0, self.retry_attempts_var.get()),
+                    max_workers=max(1, self.batch_workers_var.get()),
                     progress_callback=on_progress,
                 )
                 self.event_queue.put(("batch_complete", batch_outcome))
@@ -2185,6 +2468,8 @@ class WordToPdfApp:
                 output_dir,
                 recursive=self.recursive_var.get(),
                 overwrite=self.overwrite_var.get(),
+                retry_attempts=max(0, self.retry_attempts_var.get()),
+                max_workers=max(1, self.batch_workers_var.get()),
                 progress_callback=on_progress,
             )
             self.event_queue.put(("batch_complete", batch_outcome))
@@ -2223,34 +2508,284 @@ class WordToPdfApp:
                     self.progress_var.set(100)
                     summary = format_batch_summary(batch_outcome.results)
                     self.status_var.set(summary)
-                    self._append_result("INFO", "-", "-", summary)
-                    session_note = (
-                        "This batch reused a single Word session."
-                        if batch_outcome.reused_single_session
-                        else (
-                            "This batch automatically restarted the Word session "
-                            f"{batch_outcome.session_restarts} time(s) after consecutive failures."
-                        )
+                    self._append_result(
+                        "INFO",
+                        "-",
+                        "-",
+                        summary,
+                        prefer_selection=False,
                     )
-                    self._append_result("INFO", "-", "-", session_note)
+                    if batch_outcome.parallel_workers_used > 1:
+                        session_note = (
+                            f"This batch used {batch_outcome.parallel_workers_used} parallel Office workers "
+                            f"and restarted sessions {batch_outcome.session_restarts} time(s)."
+                        )
+                    elif batch_outcome.reused_single_session:
+                        session_note = "This batch reused a single Office session."
+                    else:
+                        session_note = (
+                            "This batch automatically restarted the Office session "
+                            f"{batch_outcome.session_restarts} time(s) after failures."
+                        )
+                    self._append_result(
+                        "INFO",
+                        "-",
+                        "-",
+                        session_note,
+                        prefer_selection=False,
+                    )
                     self._append_result(
                         "INFO",
                         "-",
                         "-",
                         f"Batch duration: {_format_duration(batch_outcome.duration_seconds)}",
+                        prefer_selection=False,
                     )
                     if batch_outcome.warning:
-                        self._append_result("INFO", "-", "-", batch_outcome.warning)
+                        self._append_result(
+                            "INFO",
+                            "-",
+                            "-",
+                            batch_outcome.warning,
+                            prefer_selection=False,
+                        )
                     self._set_running_state(False)
                 elif event_type == "error":
                     self.status_var.set("Conversion failed.")
-                    self._append_result("ERROR", "-", "-", str(payload))
+                    self._append_result(
+                        "ERROR",
+                        "-",
+                        "-",
+                        str(payload),
+                        prefer_selection=False,
+                    )
                     messagebox.showerror("Conversion Error", str(payload))
                     self._set_running_state(False)
         except queue.Empty:
             pass
         finally:
-            self.root.after(150, self._poll_events)
+            self.root.after(80, self._poll_events)
+
+    def _status_symbol(self, status: str) -> str:
+        symbol_map = {
+            "OK": "OK Success",
+            "FAILED": "X Failed",
+            "ERROR": "! Error",
+            "INFO": "i Info",
+        }
+        return symbol_map.get(status.upper(), status)
+
+    def _refresh_heading_labels(self) -> None:
+        labels = {
+            "status": "Status",
+            "source": "Source",
+            "output": "Output",
+            "details": "Details",
+        }
+        arrow = " v" if self.sort_descending else " ^"
+        for column, label in labels.items():
+            heading = label + arrow if column == self.sort_column else label
+            self.results_table.heading(
+                column,
+                text=heading,
+                command=lambda col=column: self._sort_results_by(col),
+            )
+
+    def _selected_row_values(self) -> tuple[str, str, str, str] | None:
+        item_id = self._selected_item_id()
+        if not item_id:
+            return None
+        values = self.results_table.item(item_id, "values")
+        if len(values) != 4:
+            return None
+        status, source, output, details = (str(value) for value in values)
+        for prefix in ("OK ", "X ", "! ", "i "):
+            if status.startswith(prefix):
+                status = status[len(prefix) :]
+                break
+        return status, source, output, details
+
+    def _result_value_to_path(self, value: str) -> Path | None:
+        if not value or value == "-":
+            return None
+        return Path(value)
+
+    def _preview_fallback_values(self) -> tuple[str, str, str, str] | None:
+        input_text = self.input_var.get().strip()
+        output_text = self.output_var.get().strip()
+        if not input_text and not output_text:
+            return None
+        details = (
+            "Current input/output selection. Run a conversion or select a result row for more details."
+        )
+        return ("Current", input_text or "-", output_text or "-", details)
+
+    def _set_preview_button_states(
+        self,
+        source_path: Path | None,
+        output_path: Path | None,
+    ) -> None:
+        self.open_source_button.configure(
+            state="normal" if source_path is not None else "disabled"
+        )
+        self.open_output_button.configure(
+            state="normal" if output_path is not None else "disabled"
+        )
+        self.open_folder_button.configure(
+            state="normal" if output_path is not None else "disabled"
+        )
+
+    def _update_preview_panel(self, values: tuple[str, str, str, str] | None) -> None:
+        if values is None:
+            values = self._preview_fallback_values()
+            if values is None:
+                self.preview_title_var.set(
+                    "Select a result row to inspect source and output details."
+                )
+                self.preview_source_var.set("-")
+                self.preview_output_var.set("-")
+                self.preview_details_var.set("-")
+                self._set_preview_button_states(None, None)
+                return
+
+        status, source, output, details = values
+        self.preview_title_var.set(f"{status} item preview")
+        self.preview_source_var.set(source)
+        self.preview_output_var.set(output)
+        self.preview_details_var.set(details)
+        source_path = self._result_value_to_path(source)
+        output_path = self._result_value_to_path(output)
+        self._set_preview_button_states(source_path, output_path)
+
+    def _handle_result_selection(self, event: tk.Event[tk.Misc] | None = None) -> None:
+        self._update_preview_panel(self._selected_row_values())
+
+    def _effective_preview_values(self) -> tuple[str, str, str, str] | None:
+        return self._selected_row_values() or self._preview_fallback_values()
+
+    def _open_path(self, path: Path, label: str) -> None:
+        if not path.exists():
+            self.status_var.set(f"{label} does not exist.")
+            return
+        try:
+            os.startfile(str(path))
+            self.status_var.set(f"Opened {label.lower()}: {path}")
+        except OSError as exc:
+            self.status_var.set(f"Unable to open {label.lower()}: {exc}")
+
+    def _open_selected_source(self) -> None:
+        values = self._effective_preview_values()
+        if values is None:
+            self.status_var.set("Select a result row or choose an input file first.")
+            return
+        _, source, _, _ = values
+        source_path = self._result_value_to_path(source)
+        if source_path is None:
+            self.status_var.set("No source path is available right now.")
+            return
+        self._open_path(source_path, "Source file")
+
+    def _open_selected_output_file(self) -> None:
+        values = self._effective_preview_values()
+        if values is None:
+            self.status_var.set("Select a result row or choose an output path first.")
+            return
+        _, _, output, _ = values
+        output_path = self._result_value_to_path(output)
+        if output_path is None:
+            self.status_var.set("No output file is available right now.")
+            return
+        self._open_path(output_path, "Output file")
+
+    def _current_config(self) -> AppConfig:
+        return AppConfig(
+            mode=self.mode_var.get(),
+            last_input=self.input_var.get().strip(),
+            last_output=self.output_var.get().strip(),
+            recursive=bool(self.recursive_var.get()),
+            overwrite=bool(self.overwrite_var.get()),
+            failures_only=bool(self.failures_only_var.get()),
+            retry_attempts=max(0, int(self.retry_attempts_var.get())),
+            batch_workers=max(1, int(self.batch_workers_var.get())),
+            watch_enabled=bool(self.watch_enabled_var.get()),
+            watch_interval_seconds=max(1.0, self.config.watch_interval_seconds),
+        )
+
+    def _persist_config(self) -> None:
+        self.config = self._current_config()
+        save_app_config(self.config)
+
+    def _handle_close(self) -> None:
+        self._persist_config()
+        self.root.destroy()
+
+    def _watch_input_directory(self) -> Path | None:
+        if self.mode_var.get() != "directory" or self.dropped_files:
+            return None
+        input_text = self.input_var.get().strip()
+        if not input_text:
+            return None
+        path = Path(input_text).expanduser()
+        if not path.exists() or not path.is_dir():
+            return None
+        return path.resolve()
+
+    def _snapshot_supported_files(
+        self, directory: Path
+    ) -> dict[Path, tuple[int, int]]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        for path in collect_supported_files(
+            directory,
+            recursive=bool(self.recursive_var.get()),
+        ):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    def _poll_folder_watch(self) -> None:
+        try:
+            watch_dir = self._watch_input_directory()
+            if not self.watch_enabled_var.get() or watch_dir is None:
+                self.watch_snapshot = {}
+                return
+
+            snapshot = self._snapshot_supported_files(watch_dir)
+            if not self.watch_snapshot:
+                self.watch_snapshot = snapshot
+                return
+
+            added = [path for path in snapshot if path not in self.watch_snapshot]
+            removed = [path for path in self.watch_snapshot if path not in snapshot]
+            changed = [
+                path
+                for path, info in snapshot.items()
+                if path in self.watch_snapshot and self.watch_snapshot[path] != info
+            ]
+            if added or removed or changed:
+                details = []
+                if added:
+                    details.append(f"added {len(added)}")
+                if changed:
+                    details.append(f"updated {len(changed)}")
+                if removed:
+                    details.append(f"removed {len(removed)}")
+                summary = (
+                    f"Watch detected changes in {watch_dir.name}: {', '.join(details)}."
+                )
+                self.status_var.set(summary)
+                self._append_result("INFO", str(watch_dir), "-", summary)
+                LOGGER.info(summary)
+            self.watch_snapshot = snapshot
+        except Exception as exc:
+            LOGGER.warning("Folder watch failed: %s", exc)
+        finally:
+            self.root.after(
+                int(max(1.0, self.config.watch_interval_seconds) * 1000),
+                self._poll_folder_watch,
+            )
 
     def run(self) -> None:
         self.root.mainloop()

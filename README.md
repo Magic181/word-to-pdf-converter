@@ -1,32 +1,28 @@
 # Office to PDF Converter
 
-A lightweight Windows tool for converting Word/Excel/PowerPoint documents to PDF with high layout fidelity.
-
-This project uses `pywin32` to automate a locally installed Microsoft Word instance and export `.doc` or `.docx` files to PDF. It now supports both command-line usage and a desktop GUI, including batch conversion for entire directories.
+A Windows desktop tool for converting Word, Excel, and PowerPoint files to PDF with Microsoft Office automation.
 
 ## Features
 
-- Convert Word files (`.doc`, `.docx`) to PDF
-- Convert Excel files (`.xls`, `.xlsx`, `.xlsm`, `.xlsb`) to PDF
-- Convert PowerPoint files (`.ppt`, `.pptx`, `.pptm`) to PDF
-- Launch a desktop GUI for easier everyday use
-- Support drag and drop for input files, input folders, and output targets in the GUI
-- Batch-convert all Word files in a directory
-- Optionally scan subdirectories recursively
-- Use the source filename by default and export beside the original document
-- Support custom output paths
-- Support overwriting an existing PDF
-- Keep formatting by relying on Microsoft Word's native export
+- Convert Word files: `.doc`, `.docx`
+- Convert Excel files: `.xls`, `.xlsx`, `.xlsm`, `.xlsb`
+- Convert PowerPoint files: `.ppt`, `.pptx`, `.pptm`
+- Use the CLI or the built-in desktop GUI
+- Convert one file, a whole directory, or a dragged-in file list
+- Reuse Office sessions for batch work to reduce startup overhead
+- Retry failed files automatically and rebuild the Office session when needed
+- Run batch jobs with configurable parallel workers
+- Drag and drop files, folders, and output targets in the GUI
+- Inspect results in a sortable table with preview details and quick-open actions
+- Watch an input folder in the GUI and surface file changes in the results list
 
 ## Requirements
 
 - Windows
 - Python 3.10 or newer
-- Microsoft Word installed locally
+- Microsoft Office installed locally
 
 ## Installation
-
-Install dependencies directly:
 
 ```bash
 pip install -r requirements.txt
@@ -38,18 +34,24 @@ Or install the project as a command-line tool:
 pip install .
 ```
 
-## Usage
+## CLI Usage
 
-Run the script directly:
+Convert a single file:
 
 ```bash
 python main.py "D:\docs\example.docx"
 ```
 
-Run the installed command:
+Choose a custom output path:
 
 ```bash
-wp-transform "D:\docs\example.docx"
+python main.py "D:\docs\budget.xlsx" -o "D:\output\budget.pdf"
+```
+
+Run a recursive batch with retries and parallel workers:
+
+```bash
+python main.py "D:\docs\office-files" -o "D:\docs\pdf-output" --recursive --overwrite --retry-attempts 1 --workers 2
 ```
 
 Launch the GUI:
@@ -58,54 +60,28 @@ Launch the GUI:
 python main.py --gui
 ```
 
-Or simply run without arguments:
+Or simply:
 
 ```bash
 python main.py
 ```
 
-Specify an output PDF path:
+## GUI Highlights
 
-```bash
-wp-transform "D:\docs\example.docx" -o "D:\output\example.pdf"
-```
-
-Overwrite an existing PDF:
-
-```bash
-wp-transform "D:\docs\example.docx" --overwrite
-```
-
-Batch-convert a directory:
-
-```bash
-wp-transform "D:\docs\word-files" -o "D:\docs\pdf-output" --overwrite
-```
-
-Batch-convert a directory recursively:
-
-```bash
-wp-transform "D:\docs\word-files" -o "D:\docs\pdf-output" --recursive --overwrite
-```
-
-When the input is a directory:
-
-- `input_path` is treated as the source folder
-- `-o/--output` is treated as the target folder
-- the relative folder structure is preserved in the output directory
-
-## Example Output
-
-```text
-Converted successfully: D:\docs\example.pdf
-```
+- Drag one Office file to switch into single-file mode
+- Drag a folder to switch into directory batch mode
+- Drag multiple supported files to create a one-off batch queue
+- Tune retry count and batch workers from the left-side options panel
+- Watch the selected input folder for added, changed, or removed Office files
+- Review each result in the preview panel and open the source, output file, or output folder
 
 ## Notes
 
-- If Microsoft Word is not installed, conversion will fail.
 - This tool is designed for local desktop use, not for headless servers.
-- The conversion quality depends on Word being able to open the source document normally.
-- In batch mode, files that fail to convert are reported individually in the log or terminal output.
+- Conversion quality depends on Microsoft Office being able to open the source file normally.
+- Batch jobs may open multiple Office instances when parallel workers are greater than `1`.
+- Runtime settings are stored locally in `app_config.json`.
+- Runtime logs are written to `office_to_pdf.log`.
 
 ## Project Structure
 
@@ -119,4 +95,4 @@ Converted successfully: D:\docs\example.pdf
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).
